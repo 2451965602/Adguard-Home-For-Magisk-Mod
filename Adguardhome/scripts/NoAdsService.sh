@@ -1,14 +1,29 @@
 #!/system/bin/sh
-AGH_DIR="/data/adb/agh"
-
 # 防止重复启动
-[ $(pgrep -f "$0" | wc -l) -gt 1 ] && exit
+process_count=$(pgrep -f "$0" | wc -l)
+[ "$process_count" -gt 1 ] && exit
 
 # 广告屏蔽核心函数
-block_ad(){ [ ! -e "$1" ]&&return;lsattr -d "$1"|grep -q "i.*$1"&&return;[ -d "$1" ]&&(rm -rf "$1"&&mkdir -p "$1")&&chattr +i "$1"&&return;[ -f "$1" ]&&> "$1"&&chattr +i "$1"; }
+block_ad() {
+    path=$1
+    [ -e "$path" ] || return 0
 
-# 执行循环
-while :;do
+    # lsattr 的第一个字段是属性 flags，只检查其中的 immutable 位。
+    attrs=$(lsattr -d "$path" 2>/dev/null) || attrs=
+    flags=${attrs%%[[:space:]]*}
+    case "$flags" in
+        ????i*) return 0 ;;
+    esac
+
+    if [ -d "$path" ]; then
+        rm -rf "$path" && mkdir -p "$path" && chattr +i "$path"
+    elif [ -f "$path" ]; then
+        : > "$path" && chattr +i "$path"
+    fi
+}
+
+# 完整广告路径扫描
+scan_ads() {
 
 # 添加完屏蔽路径以后必须重启手机生效
     # 美团外卖
@@ -199,15 +214,41 @@ while :;do
    block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/M_Cloud/temp/bigcloudimage"
    block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/boot_logo"
 
-# 自动关闭私人DNS
-[ "$(settings get global private_dns_mode)" = "off" ] || settings put global private_dns_mode off
+}
 
-# 自动清空IFW文件夹
-[ -d "/data/system/ifw" ]&&for f in /data/system/ifw/*;do [ -e "$f" ]&&rm -rf /data/system/ifw/*&&break;done
+# 开机立即执行一次完整广告路径扫描。
+scan_ads
 
-# 专清/data/data卸载残留
-for d in /data/data/*==deleted==;do [ -d "$d" ]&&chattr -R -i "$d"&&rm -rf "$d";done
+# 其余维护每小时执行；完整广告路径每 6 小时复查一次。
+scan_hours=0
+while :; do
+    # 自动关闭私人DNS
+    [ "$(settings get global private_dns_mode)" = "off" ] || settings put global private_dns_mode off
 
-# 延迟启动
-sleep 5
+    # 自动清空IFW文件夹
+    if [ -d "/data/system/ifw" ]; then
+        for f in /data/system/ifw/*; do
+            [ -e "$f" ] && rm -rf /data/system/ifw/* && break
+        done
+    fi
+
+    # 专清 /data/data 中符合 AOSP installd 命名的卸载残留。
+    for d in /data/data/????????-????-????-????-????????????==deleted==; do
+        [ -d "$d" ] || continue
+        name=${d##*/}
+        case "$name" in
+            ????????-????-????-????-????????????==deleted==)
+                chattr -R -i "$d" && rm -rf "$d"
+                ;;
+        esac
+    done
+
+    scan_hours=$((scan_hours + 1))
+    if [ "$scan_hours" -ge 6 ]; then
+        scan_ads
+        scan_hours=0
+    fi
+
+    # 延迟一小时后执行下一轮维护。
+    sleep 3600
 done

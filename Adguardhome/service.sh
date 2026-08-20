@@ -1,11 +1,12 @@
 #!/system/bin/sh
+MODDIR=${0%/*}
 SCRIPT_DIR="/data/adb/agh/scripts"
-ADGPATH="/data/adb/modules/AdGuardHome"
+ADGPATH="$MODDIR"
 AGH_DIR="/data/adb/agh"
 BIN_DIR="$AGH_DIR/bin"
 MAIN_LOG="$AGH_DIR/agh.log"
 MODULES_DIR="/data/adb/modules"
-AGH_MODULE_PROP="/data/adb/modules/AdGuardHome/module.prop"
+AGH_MODULE_PROP="$MODDIR/module.prop"
 
 # 解锁脚本防篡改保护
 find "$ADGPATH" -type f -name "*.sh" -exec chattr -i {} \;
@@ -37,9 +38,54 @@ if [ "$found_hosts" = true ]; then
 fi
 
 # 动态端口随机化
-R1=$((30000+RANDOM%35536)); R2=$((30000+RANDOM%35536))
-sed -i "s/^\([[:space:]]*port:\) [0-9]*/\1 $R1/; s/^\([[:space:]]*address:\) 127\.0\.0\.1:[0-9]*/\1 127.0.0.1:$R2/" "$BIN_DIR/AdGuardHome.yaml"
-sed -i "s/^redir_port=.*/redir_port=$R1/" "$SCRIPT_DIR/config.prop" || echo "redir_port=$R1" > "$SCRIPT_DIR/config.prop"
+R1=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+R1=$((R1 % 35536 + 30000))
+R2=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+R2=$((R2 % 35536 + 30000))
+while [ "$R1" -eq "$R2" ]; do
+    R2=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+    R2=$((R2 % 35536 + 30000))
+done
+YAML_TMP="$BIN_DIR/AdGuardHome.yaml.$$"
+if awk -v dns_port="$R1" -v http_port="$R2" '
+    /^[^[:space:]#][^:]*:/ { block="" }
+    /^dns:[[:space:]]*$/ { block="dns" }
+    /^http:[[:space:]]*$/ { block="http" }
+    block == "dns" && /^  port:[[:space:]]*[0-9]+[[:space:]]*$/ {
+        print "  port: " dns_port
+        dns_found=1
+        next
+    }
+    block == "http" && /^  address:[[:space:]]*127\.0\.0\.1:[0-9]+[[:space:]]*$/ {
+        print "  address: 127.0.0.1:" http_port
+        http_found=1
+        next
+    }
+    { print }
+    END { if (!dns_found || !http_found) exit 1 }
+' "$BIN_DIR/AdGuardHome.yaml" > "$YAML_TMP" &&
+    mv -f "$YAML_TMP" "$BIN_DIR/AdGuardHome.yaml"; then
+    :
+else
+    rm -f "$YAML_TMP"
+    echo "$(date '+%F %T') [ERROR] AdGuardHome.yaml 修改失败，已中止启动。" >> "$MAIN_LOG"
+    exit 1
+fi
+if grep -q '^redir_port=' "$SCRIPT_DIR/config.prop" 2>/dev/null; then
+    sed -i "s/^redir_port=.*/redir_port=$R1/" "$SCRIPT_DIR/config.prop" || {
+        echo "$(date '+%F %T') [ERROR] config.prop 写入失败，已中止启动。" >> "$MAIN_LOG"
+        exit 1
+    }
+else
+    printf 'redir_port=%s\n' "$R1" >> "$SCRIPT_DIR/config.prop" || {
+        echo "$(date '+%F %T') [ERROR] config.prop 写入失败，已中止启动。" >> "$MAIN_LOG"
+        exit 1
+    }
+fi
+
+if [ -f "$MAIN_LOG" ] && [ "$(wc -c < "$MAIN_LOG")" -gt 102400 ]; then
+    : > "$MAIN_LOG"
+fi
 
 # 启动AdGuardHome
 export SSL_CERT_DIR="/system/etc/security/cacerts/"
@@ -47,16 +93,17 @@ export SSL_CERT_DIR="/system/etc/security/cacerts/"
 
 # 验证AdGuardHome是否启动成功
 sleep 1
-if pgrep "AdGuardHome"; then
+if pgrep -x "AdGuardHome" >/dev/null; then
     [ "$lang" = "zh" ] && echo "$(date '+%F %T') AdGuardHome 启动成功。" >> "$MAIN_LOG" || echo "$(date '+%F %T') AdGuardHome started successfully." >> "$MAIN_LOG"
 else
     [ "$lang" = "zh" ] && echo "$(date '+%F %T') AdGuardHome启动失败，尝试重启..." >> "$MAIN_LOG" || echo "$(date '+%F %T') AdGuardHome failed to start, attempting restart..." >> "$MAIN_LOG"
+    sleep 60
     exec "$0"
 fi
 
 # 启动模块附加脚本
 "$SCRIPT_DIR/iptables.sh" &
-"$SCRIPT_DIR/ModuleMOD.sh" &
+"$SCRIPT_DIR/ModuleMOD.sh"
 "$SCRIPT_DIR/NoAdsService.sh" &
 "$SCRIPT_DIR/ProxyConfig.sh" &
 

@@ -1,4 +1,5 @@
 #!/system/bin/sh
+# shellcheck disable=SC2034 # 由 Magisk/KernelSU 安装器读取。
 SKIPUNZIP=1
 
 # 多语言检测
@@ -10,7 +11,11 @@ case $locale in
   *)   language=zh ;;
 esac
 i18n_print() {
-  [ "$language" = "zh" ] && ui_print "$2" || ui_print "$1"
+  if [ "$language" = "zh" ]; then
+    ui_print "$2"
+  else
+    ui_print "$1"
+  fi
 }
 
 # 检测所有Hosts模块
@@ -23,41 +28,95 @@ BIN_DIR="$AGH_DIR/bin"
 SCRIPT_DIR="$AGH_DIR/scripts"
 BACKUP_DIR="$AGH_DIR/backup"
 ADGPATH="/data/adb/modules/AdGuardHome"
-PROXY_SCRIPT="$AGH_DIR/scripts/ProxyConfig.sh"
+
+# 停止旧版模块脚本并等待其退出
+i18n_print "- Stopping module service processes" "- 正在终止模块服务进程"
+pkill -TERM -f '[/]iptables.sh'
+pkill -TERM -f '[/]NoAdsService.sh'
+pkill -TERM -f '[/]ProxyConfig.sh'
+pkill -TERM -f '[/]ModuleMOD.sh'
+module_processes_stopped() {
+    ! pgrep -f '[/]iptables.sh' >/dev/null 2>&1 &&
+    ! pgrep -f '[/]NoAdsService.sh' >/dev/null 2>&1 &&
+    ! pgrep -f '[/]ProxyConfig.sh' >/dev/null 2>&1 &&
+    ! pgrep -f '[/]ModuleMOD.sh' >/dev/null 2>&1
+}
+i=0
+while [ "$i" -lt 5 ]; do
+    module_processes_stopped && break
+    sleep 1
+    i=$((i+1))
+done
+if ! module_processes_stopped; then
+    pkill -KILL -f '[/]iptables.sh'
+    pkill -KILL -f '[/]NoAdsService.sh'
+    pkill -KILL -f '[/]ProxyConfig.sh'
+    pkill -KILL -f '[/]ModuleMOD.sh'
+fi
+if ! module_processes_stopped; then
+    ui_print "- Module service processes did not exit; installation aborted."
+    ui_print "- 模块服务进程未退出，安装已中止。"
+    printf '%s [ERROR] 模块服务进程未退出，已中止安装。\n' "$(date '+%F %T')" >> "$AGH_DIR/agh.log"
+    exit 1
+fi
+
+# 守护脚本退出后停止AdGuardHome
+if [ -d "$AGH_DIR" ]; then
+    i18n_print "- Stopping all AdGuard Home processes" "- 正在终止AdGuard Home进程"
+    pkill -9 "AdGuardHome"
+    agh_stopped=false
+    w=0
+    while pgrep -x "AdGuardHome" >/dev/null 2>&1; do
+        [ "$w" -ge 3 ] && break
+        sleep 1
+        w=$((w + 1))
+    done
+    if pgrep -x "AdGuardHome" >/dev/null 2>&1; then
+        i18n_print "- AdGuardHome did not stop, aborting installation" "- AdGuardHome未退出，已中止安装"
+        exit 1
+    fi
+fi
+
+# 清理本模块新规则；旧通用规则所有权不明，禁止触碰
+while iptables -w 2 -t nat -D OUTPUT -j AGHMOD_DNS4 >/dev/null 2>&1; do :; done
+iptables -w 2 -t nat -F AGHMOD_DNS4 >/dev/null 2>&1
+iptables -w 2 -t nat -X AGHMOD_DNS4 >/dev/null 2>&1
+while ip6tables -w 2 -D OUTPUT -j AGHMOD_DNS6 >/dev/null 2>&1; do :; done
+ip6tables -w 2 -F AGHMOD_DNS6 >/dev/null 2>&1
+ip6tables -w 2 -X AGHMOD_DNS6 >/dev/null 2>&1
 
 i18n_print "- Extracting basic module files" "- 正在解压模块基本文件"
 for file in uninstall.sh module.prop service.sh action.sh; do
   unzip -o "$ZIPFILE" "$file" -d "$MODPATH"
 done
 
-# 正在停止ProxyConfig
-[ -f "$AGH_DIR/scripts/ProxyConfig.sh" ] && {
-    i18n_print "- Stopping ProxyConfig process" "- 正在终止ProxyConfig进程"
-    pkill -9 "ProxyConfig"
-}
-
-# 检查并停止运行中的进程
-if [ -d "$AGH_DIR" ]; then
-i18n_print "- Stopping all AdGuard Home processes" "- 正在终止AdGuard Home进程"
-pkill -9 "AdGuardHome"
-fi
-
-# 正在停止NoAdsService
-[ -f "$AGH_DIR/scripts/NoAdsService.sh" ] && {
-    i18n_print "- Stopping NoAdsService process" "- 正在终止NoAdsService进程"
-    pkill -9 "NoAdsService"
-}
-
-# 正在停止ProxyConfig
-[ -f "$AGH_DIR/scripts/ProxyConfig.sh" ] && {
-    i18n_print "- Stopping ProxyConfig process" "- 正在终止ProxyConfig进程"
-    pkill -9 "ProxyConfig"
-}
-
 # 删除被锁定的残留文件
 [ -f "$AGH_DIR/scripts/NoAdsService.sh" ] && {
     i18n_print "- Removing locked residual files" "- 正在删除被锁定的残留文件"
-    local c=0 u=0 p;while IFS= read -r p;do [ -n "$p" ]&&[ -e "$p" ]&&while IFS= read -r f;do c=$((c+1));if [ -d "$f" ];then lsattr -d "$f" |grep -q "i-"&&{ chattr -i "$f";rmdir "$f"&&u=$((u+1));} else lsattr "$f" |grep -q "i-"&&{ chattr -i "$f";rm -f "$f";u=$((u+1));};fi;done< <(find "$p" \( -type f -o -type d \));done< <(grep 'block_ad' "$AGH_DIR/scripts/NoAdsService.sh"|grep -o '".*"'|tr -d '"')
+    c=0
+    u=0
+    cleanup_paths="$AGH_DIR/.noads_paths.$$"
+    cleanup_files="$AGH_DIR/.noads_files.$$"
+    grep 'block_ad' "$AGH_DIR/scripts/NoAdsService.sh" | grep -o '".*"' | tr -d '"' > "$cleanup_paths"
+    : > "$cleanup_files"
+    while IFS= read -r p; do
+        [ -n "$p" ] && [ -e "$p" ] && find "$p" \( -type f -o -type d \) >> "$cleanup_files"
+    done < "$cleanup_paths"
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        c=$((c+1))
+        if [ -d "$f" ]; then
+            if lsattr -d "$f" | grep -q "i-"; then
+                chattr -i "$f"
+                rmdir "$f" && u=$((u+1))
+            fi
+        elif lsattr "$f" | grep -q "i-"; then
+            chattr -i "$f"
+            rm -f "$f"
+            u=$((u+1))
+        fi
+    done < "$cleanup_files"
+    rm -f "$cleanup_paths" "$cleanup_files"
     i18n_print "- Removed $u locked files out of $c scanned items" "- 从 $c 个文件中删除了 $u 个锁定文件"
 }
 
