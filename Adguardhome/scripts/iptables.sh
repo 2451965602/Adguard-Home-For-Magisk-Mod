@@ -3,12 +3,22 @@ AGH_DIR="/data/adb/agh"
 # shellcheck disable=SC1091
 . "$AGH_DIR/scripts/config.prop"
 MAIN_LOG="$AGH_DIR/agh.log"
+# 端口真相源：AGH 实际加载的 AdGuardHome.yaml 中 dns.port。
+# config.prop 可能因 service.sh 重试循环漂移，yaml 才是运行实例的真实端口；
+# 重定向到漂移端口会导致全系统 DNS 中断。
+AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9]+/{print $2; exit}' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null)
+[ -n "$AGH_YAML_PORT" ] && redir_port="$AGH_YAML_PORT"
 
 # 仅由 service.sh 后台化；本脚本必须保持前台运行。
-# 防止重复启动（不使用锁文件，避免把锁 FD 传给 AdGuardHome）。
-case "$0" in
-    */iptables.sh) [ "$(pgrep -f '[/]iptables.sh' | wc -l)" -gt 1 ] && exit ;;
-esac
+# 防止重复启动：mkdir 原子锁（不使用锁文件，避免把锁 FD 传给 AdGuardHome；
+# 也不依赖 pgrep -f——它会误计命令替换 fork 的子进程，且开机早期可能不可用）。
+LOCK_DIR="/data/adb/agh/.iptables.lock"
+if [ -d "$LOCK_DIR" ]; then
+    # 超过 2 小时视为残留锁（本脚本守护周期 60 秒），强制清除
+    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +120 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+fi
+mkdir "$LOCK_DIR" 2>/dev/null || exit
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 # shellcheck disable=SC2154
 ensure_ipv4_rules() {
@@ -118,23 +128,23 @@ cleanup_agh6_rules() {
     ip6tables -w 2 -X AGHMOD_DNS6 >/dev/null 2>&1
 }
 
-# 启动 AdGuardHome（掉进程重启）
-restart_agh() {
-    pgrep -x "AdGuardHome" || {
-        {
-            case "$(getprop persist.sys.locale)" in
-                zh*) echo "$(date '+%F %T') AdGuardHome 进程丢失，正在重启..." ;;
-                *)   echo "$(date '+%F %T') AdGuardHome process lost, restarting..." ;;
-            esac
-        } >> "$MAIN_LOG"
-        export SSL_CERT_DIR="/system/etc/security/cacerts/"
-        "$AGH_DIR/bin/AdGuardHome" --no-check-update &
-    }
+# AGH 进程健康检查：仅记日志警告，不拉起（生命周期由 service.sh 管理）。
+# 不用 pgrep 判存活：开机早期 KernelSU 环境下 pgrep 可能不可用（返回 127 被
+# 误判为进程不存在），导致每 60 秒刷一条误报警告。以 redir_port 端口监听为准。
+warn_if_agh_down() {
+    hex_port=$(printf '%04X' "$redir_port" 2>/dev/null)
+    [ -n "$hex_port" ] || return
+    awk -v p="$hex_port" '$2 ~ /^(0100007F|00000000):/ { split($2, a, ":"); if (toupper(a[2]) == p && $4 == "0A") { found=1; exit } } END { exit !found }' /proc/net/tcp 2>/dev/null && return
+    awk -v p="$hex_port" '$2 ~ /^(0100007F|00000000):/ { split($2, a, ":"); if (toupper(a[2]) == p && $3 ~ /:0000$/) { found=1; exit } } END { exit !found }' /proc/net/udp 2>/dev/null && return
+    case "$(getprop persist.sys.locale)" in
+        zh*) echo "$(date '+%F %T') [WARN] AdGuardHome 端口 $redir_port 未监听，等待 service.sh 拉起" ;;
+        *)   echo "$(date '+%F %T') [WARN] AdGuardHome port $redir_port not listening, awaiting service.sh restart" ;;
+    esac >> "$MAIN_LOG"
 }
 
 # 规则守护循环
 while true; do
-    restart_agh
+    warn_if_agh_down
     # IPv4 和 IPv6 独立检测：box 可能只接管其中一栈。
     # 三态：0=active（清理 AGH），1=inactive（安装/维护 AGH），2=unknown（跳过本轮）。
     box_dns4_active; v4_rc=$?

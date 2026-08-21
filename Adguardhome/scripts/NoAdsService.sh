@@ -1,7 +1,13 @@
 #!/system/bin/sh
-# 防止重复启动
-process_count=$(pgrep -f "$0" | wc -l)
-[ "$process_count" -gt 1 ] && exit
+# 防止重复启动：mkdir 原子锁（pgrep -f 会把命令替换 fork 的子进程计入自身，
+# 且开机早期 KernelSU 环境下 pgrep 可能不可用，两种情况都会误判）。
+LOCK_DIR="/data/adb/agh/.noads.lock"
+if [ -d "$LOCK_DIR" ]; then
+    # 超过 25 小时视为残留锁（本脚本主循环周期 1 小时），强制清除
+    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1500 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+fi
+mkdir "$LOCK_DIR" 2>/dev/null || exit
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 # 广告屏蔽核心函数
 block_ad() {

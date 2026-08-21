@@ -1,3 +1,6 @@
+- 修复开机自启动失败循环：service.sh/iptables.sh/ProxyConfig.sh/NoAdsService.sh 移除对 pgrep 的依赖（开机早期 KernelSU 环境下 pgrep 可能不可用导致判定恒假），统一改用 /proc/net 端口监听判定 AGH 就绪、mkdir 原子锁防脚本重复启动
+- iptables.sh 增加 AdGuardHome.yaml 端口真相源，防止 config.prop 端口漂移导致 DNS 重定向到死端口
+- service.sh 增加 agh_crash.log 体积看护（512KB 上限），防长期运行高频报错撑爆 /data 分区
 - 新增拦截南方基金、银华利生宝、中国移动网盘、哔哩哔哩、淘宝App、掌上莲峰的广告
 - 优化了三国志战略版以及一些App的误杀
 - 继续优化了上游DNS以及其相关问题

@@ -3,7 +3,21 @@ CONFIG_FILE="$(dirname "$0")/config.prop"
 AGH_DIR="$(dirname "$(dirname "$0")")"
 # shellcheck disable=SC1090
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-[ "$(pgrep -f "$0" | wc -l)" -gt 1 ] && exit
+
+# 单实例锁：mkdir 原子操作，不依赖 pgrep 进程名匹配
+# （shell 命令替换 fork 的子进程会复制 cmdline，pgrep 会误计自身实例）。
+LOCK_DIR="$AGH_DIR/.proxycfg.lock"
+if [ -d "$LOCK_DIR" ]; then
+    # 超过 10 分钟视为残留锁（进程被 kill -9 后遗留），强制清除
+    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+fi
+mkdir "$LOCK_DIR" 2>/dev/null || exit
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+# 端口真相源：AGH 实际加载的 AdGuardHome.yaml 中 dns.port。
+# config.prop 可能因 service.sh 重试循环漂移，yaml 才是运行实例的真实端口。
+AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9]+/{print $2; exit}' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null)
+[ -n "$AGH_YAML_PORT" ] && redir_port="$AGH_YAML_PORT"
 
 # 默认的单个空格代表未配置代理地址。
 PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
@@ -32,60 +46,103 @@ dns_transform() {
     # shellcheck disable=SC2154
     awk -v mode="$transform_mode" -v port="$redir_port" '
         function top(line) { return line ~ /^[^[:space:]#][^:]*:/ }
-        function target(k) { return k == "direct-nameserver" || k == "proxy-server-nameserver" || k == "nameserver" || k == "default-nameserver" }
+        # dns 块内 4 空格直接列表 section
+        function dns_target(k) { return k == "direct-nameserver" || k == "proxy-server-nameserver" || k == "nameserver" || k == "default-nameserver" }
+        # sniffer 块内 4 空格直接列表 section
+        function sniffer_target(k) { return k == "skip-domain" }
         function current_local_item(line) { return line ~ "^    -[ ]*127[.]0[.]0[.]1:" port "([ ]*#.*)?$" }
         function managed_local_item(line) { return line ~ "^    -[ ]*127[.]0[.]0[.]1:[0-9][0-9]*([ ]*#.*)?$" }
         function list_item(line) { return line ~ /^    -[[:space:]]/ }
         function comment_item(line) { return line ~ /^    #[[:space:]]*-/ }
-        function marker(line) { return line ~ /^    #[[:space:]]*AdGuardHome managed DNS([[:space:]]+disabled)?[[:space:]]*$/ }
+        # dns 列表 active marker（不含 disabled）
+        function active_dns_marker(line) { return line ~ /^    #[[:space:]]*AdGuardHome managed DNS[[:space:]]*$/ }
+        # dns 列表 disabled marker
+        function disabled_dns_marker(line) { return line ~ /^    #[[:space:]]*AdGuardHome managed DNS[[:space:]]+disabled[[:space:]]*$/ }
+        # dns 列表任意 marker
+        function dns_marker(line) { return active_dns_marker(line) || disabled_dns_marker(line) }
+        # sniffer.skip-domain active marker
+        function active_sniffer_marker(line) { return line ~ /^    #[[:space:]]*AdGuardHome managed sniffer[.]skip-domain[[:space:]]*$/ }
+        # sniffer.skip-domain disabled marker
+        function disabled_sniffer_marker(line) { return line ~ /^    #[[:space:]]*AdGuardHome managed sniffer[.]skip-domain[[:space:]]+disabled[[:space:]]*$/ }
+        # sniffer.skip-domain 任意 marker
+        function sniffer_marker(line) { return active_sniffer_marker(line) || disabled_sniffer_marker(line) }
         function enhanced_marker(line) { return line ~ /^  #[[:space:]]*AdGuardHome managed enhanced-mode[|]/ }
         {
             raw[NR] = $0
             if (top($0)) {
                 name = $0
                 sub(/:.*/, "", name)
-                in_dns = (name == "dns")
-                current = ""
-            } else if (in_dns && $0 ~ /^  [^[:space:]#][^:]*:/) {
+                top_block = (name == "dns" || name == "sniffer") ? name : ""
+                target_id = ""
+            } else if (top_block != "" && $0 ~ /^  [^[:space:]#][^:]*:/) {
                 key = $0
                 sub(/^  /, "", key)
                 sub(/:.*/, "", key)
-                if (target(key)) current = key
-                else current = ""
+                if (top_block == "dns" && dns_target(key)) {
+                    target_id = "dns:" key
+                } else if (top_block == "sniffer" && sniffer_target(key)) {
+                    target_id = "sniffer:" key
+                } else {
+                    target_id = ""
+                }
             }
-            section[NR] = current
-            dns_line[NR] = in_dns
-            if (in_dns && $0 ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/)
+            section[NR] = target_id
+            block[NR] = top_block
+            # 记录所有出现的 target section（含空/仅注释的 section）
+            if (target_id != "") seen_target[target_id] = 1
+            if (top_block == "dns" && $0 ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/)
                 has_enhanced = 1
-            if (current != "" && list_item($0)) {
-                has_any_list = 1
-                has_list[current] = 1
-                if (managed_local_item($0)) has_local[current] = 1
-                else if ($0 !~ /^    #[[:space:]]/) has_other[current] = 1
+            if (target_id != "" && list_item($0)) {
+                if (top_block == "dns") has_dns_list = 1
+                if (top_block == "sniffer") has_sniffer_list = 1
+                has_list[target_id] = 1
+                # managed localhost 不计入 has_other（有效配对的注入行本身）
+                if (!managed_local_item($0) && $0 !~ /^    #[[:space:]]/) has_other[target_id] = 1
             }
         }
         END {
             need = 0
-            # default-nameserver 是 mihomo 的引导 DNS，只处理可识别的旧迁移格式。
-            for (s in has_list)
-                if (s != "default-nameserver" && (!has_local[s] || has_other[s])) need = 1
-            # 带模块 marker 的 localhost 必须使用当前端口；未带 marker 的用户项可保留原端口。
+            # 有效 marker 配对统计：active marker 紧邻当前端口才算 valid_managed_pair
+            # 在 END 段计算（扫描阶段 raw[NR+1] 尚未读入）
             for (i = 1; i <= NR; i++) {
-                if (dns_line[i] && section[i] != "" && marker(raw[i])) {
+                s = section[i]
+                if (s == "" || s == "dns:default-nameserver") continue
+                l = raw[i]
+                is_active_dns = active_dns_marker(l)
+                is_active_sniffer = active_sniffer_marker(l)
+                if ((s ~ /^dns:/ && is_active_dns) || (s ~ /^sniffer:/ && is_active_sniffer)) {
+                    n = raw[i + 1]
+                    if (current_local_item(n)) valid_managed_pair[s] = 1
+                }
+            }
+            # 直接列表 section：对所有 seen_target 检查有效配对
+            for (tid in seen_target) {
+                if (tid ~ /^dns:default-nameserver$/) continue
+                if (!valid_managed_pair[tid] || has_other[tid]) need = 1
+            }
+            # marker 配对端口校验：active marker 紧邻 managed localhost 但端口非当前则 need
+            for (i = 1; i <= NR; i++) {
+                l = raw[i]
+                s = section[i]
+                if (s == "" || s == "dns:default-nameserver") continue
+                is_active_dns = active_dns_marker(l)
+                is_active_sniffer = active_sniffer_marker(l)
+                if ((s ~ /^dns:/ && is_active_dns) || (s ~ /^sniffer:/ && is_active_sniffer)) {
                     n = raw[i + 1]
                     if (managed_local_item(n) && !current_local_item(n)) need = 1
                 }
             }
-            # default-nameserver 仅在有模块 marker 时才需要处理（清理旧注入）。
+            # default-nameserver 仅在有 marker 时处理
             for (i = 1; i <= NR; i++) {
-                if (dns_line[i] && section[i] == "default-nameserver" && marker(raw[i])) need = 1
+                if (section[i] == "dns:default-nameserver" && dns_marker(raw[i])) need = 1
             }
-            if (has_any_list && !has_enhanced) need = 1
+            if (has_dns_list && !has_enhanced) need = 1
             if (mode == "check") exit need ? 1 : 0
             for (i = 1; i <= NR; i++) {
                 l = raw[i]
                 s = section[i]
-                if (mode == "clean" && dns_line[i] && enhanced_marker(l) &&
+                # enhanced-mode marker 处理（不变）
+                if (mode == "clean" && block[i] == "dns" && enhanced_marker(l) &&
                     i < NR && raw[i + 1] ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/) {
                     original = l
                     sub(/^  #[[:space:]]*AdGuardHome managed enhanced-mode[|]/, "", original)
@@ -93,71 +150,109 @@ dns_transform() {
                     i++
                     continue
                 }
-                if (mode == "process" && dns_line[i] && enhanced_marker(l) &&
+                if (mode == "process" && block[i] == "dns" && enhanced_marker(l) &&
                     i < NR && raw[i + 1] ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/) {
                     print l
                     print raw[i + 1]
                     i++
                     continue
                 }
-                if ((mode == "clean" || mode == "process") && dns_line[i] && enhanced_marker(l)) {
+                if ((mode == "clean" || mode == "process") && block[i] == "dns" && enhanced_marker(l)) {
                     print l
                     if (i < NR) { print raw[i + 1]; i++ }
                     continue
                 }
-                # marker 处理（所有 section、两种模式）：
-                # - marker + AGH 地址：default-nameserver 两种模式都丢弃（不注入）；
-                #   其他 section：process 更新为当前端口，clean 成对丢弃。
-                # - disabled marker + 被注释用户项：clean 或 default-nameserver 恢复用户项。
-                # - clean 下孤立 marker 一律移除。
-                if (s != "" && marker(l)) {
+                # dns 列表 marker 处理（命名空间隔离：仅 dns:* section）
+                if (s ~ /^dns:/ && s != "dns:default-nameserver" && dns_marker(l)) {
                     n = raw[i + 1]
                     if (managed_local_item(n)) {
-                        if (mode == "process" && s != "default-nameserver") {
+                        if (mode == "process") {
                             print l
                             print "    - 127.0.0.1:" port
                         }
                         i++
                         continue
                     }
-                    if ((mode == "clean" || s == "default-nameserver") && l ~ /disabled/ && n ~ /^    #[[:space:]]*-[[:space:]]+/) {
+                    if (mode == "clean" && l ~ /disabled/ && n ~ /^    #[[:space:]]*-[[:space:]]+/) {
                         restored = n
                         sub(/^    #[[:space:]]*/, "    ", restored)
                         print restored
                         i++
                         continue
                     }
-                    if (mode == "clean" || s == "default-nameserver") continue
+                    if (mode == "clean") continue
                     print l
                     continue
                 }
-                if (mode == "process" && dns_line[i] && l ~ /^  enhanced-mode:/ && l !~ /:[[:space:]]*redir-host([[:space:]]*#.*)?$/ && has_any_list) {
+                # sniffer.skip-domain marker 处理
+                if (s == "sniffer:skip-domain" && sniffer_marker(l)) {
+                    n = raw[i + 1]
+                    if (managed_local_item(n)) {
+                        if (mode == "process") {
+                            print l
+                            print "    - 127.0.0.1:" port
+                        }
+                        i++
+                        continue
+                    }
+                    if (mode == "clean" && l ~ /disabled/ && n ~ /^    #[[:space:]]*-[[:space:]]+/) {
+                        restored = n
+                        sub(/^    #[[:space:]]*/, "    ", restored)
+                        print restored
+                        i++
+                        continue
+                    }
+                    if (mode == "clean") continue
+                    print l
+                    continue
+                }
+                # default-nameserver marker 处理（两种模式都丢弃 AGH 注入）
+                if (s == "dns:default-nameserver" && dns_marker(l)) {
+                    n = raw[i + 1]
+                    if (managed_local_item(n)) { i++; continue }
+                    if (l ~ /disabled/ && n ~ /^    #[[:space:]]*-[[:space:]]+/) {
+                        restored = n
+                        sub(/^    #[[:space:]]*/, "    ", restored)
+                        print restored
+                        i++
+                        continue
+                    }
+                    continue
+                }
+                if (mode == "process" && block[i] == "dns" && l ~ /^  enhanced-mode:/ && l !~ /:[[:space:]]*redir-host([[:space:]]*#.*)?$/ && has_dns_list) {
                     print "  # AdGuardHome managed enhanced-mode|" l
                     print "  enhanced-mode: redir-host"
                     continue
                 }
-                if (s != "" && list_item(l)) {
-                    # default-nameserver 不注入 AGH 地址（mihomo 要求纯 IP 引导）。
-                    # 无 marker 的用户条目（含 localhost）一律原样保留，不做迁移猜测。
-                    if (s == "default-nameserver") {
-                        print l
-                        continue
-                    }
+                # 直接列表项处理（dns + sniffer）
+                if (s != "" && s != "dns:default-nameserver" && list_item(l)) {
                     if (mode == "clean") {
-                        # 仅清理紧邻模块 marker 的 AGH 注入项；孤立 localhost 保留。
                         print l
                         continue
                     }
-                    if (!inserted[s] && !has_local[s]) {
-                        print "    # AdGuardHome managed DNS"
+                    # 注入条件：当前 section 无有效 marker+当前端口配对
+                    if (!inserted[s] && !valid_managed_pair[s]) {
+                        mk = (s == "sniffer:skip-domain") ? "    # AdGuardHome managed sniffer.skip-domain" : "    # AdGuardHome managed DNS"
+                        print mk
                         print "    - 127.0.0.1:" port
                         inserted[s] = 1
                     }
-                    if (managed_local_item(l) || l ~ /^    #[[:space:]]/) print l
+                    # 无 marker 的旧端口 localhost 视为用户项，注释保留
+                    if (managed_local_item(l) && !current_local_item(l)) {
+                        mk = (s == "sniffer:skip-domain") ? "    # AdGuardHome managed sniffer.skip-domain disabled" : "    # AdGuardHome managed DNS disabled"
+                        print mk
+                        print "    # " substr(l, 5)
+                    } else if (managed_local_item(l) || l ~ /^    #[[:space:]]/) print l
                     else {
-                        print "    # AdGuardHome managed DNS disabled"
+                        mk = (s == "sniffer:skip-domain") ? "    # AdGuardHome managed sniffer.skip-domain disabled" : "    # AdGuardHome managed DNS disabled"
+                        print mk
                         print "    # " substr(l, 5)
                     }
+                    continue
+                }
+                # default-nameserver 列表项：不注入 AGH，原样保留
+                if (s == "dns:default-nameserver" && list_item(l)) {
+                    print l
                     continue
                 }
                 print l
@@ -311,10 +406,11 @@ process_config() {
     rewrite_config process "$1"
 }
 
-# AGH 就绪 = 进程存在且 redir_port 在 127.0.0.1/wildcard 上 TCP 和 UDP 均监听。
+# AGH 就绪 = redir_port 在 127.0.0.1/wildcard 上 TCP 和 UDP 均监听。
 # 按列解析 /proc/net：本地地址列须为 0100007F 或 00000000 且含 :HEXPORT。
+# 不用 pgrep 判存活：开机早期 KernelSU 环境下 pgrep 可能不可用（返回 127 被
+# 误判为进程不存在，导致配置修改被永久跳过）。端口监听即就绪。
 agh_ready() {
-    pgrep -x "AdGuardHome" >/dev/null 2>&1 || return 1
     hex_port=$(printf '%04X' "$redir_port")
     # TCP：本地地址为 IPv4 127.0.0.1/wildcard + 端口，状态 0A (LISTEN)
     awk -v p="$hex_port" '
