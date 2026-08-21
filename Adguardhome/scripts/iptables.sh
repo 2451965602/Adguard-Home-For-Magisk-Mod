@@ -102,11 +102,14 @@ box_dns4_active() {
 }
 
 # IPv6 box DNS 接管检测（三态聚合：active 优先于 unknown）
+# box 的 IPv6 nat 链带 6 后缀（NAT_DNS_HIJACK6/NAT_DNS_FORWARD6），与 IPv4 链名不同。
+# tun 模式下 box 不创建任何 DNS 劫持链（DNS 由 tun 接口内部劫持），三链探测必然
+# miss，此时 AGH 抢挂 nat REDIRECT 是预期接管行为：本机 DNS 进 AGH 而非 mihomo。
 box_dns6_active() {
     saw_unknown=0
-    box_chain_dns_active ip6tables nat NAT_DNS_HIJACK; rc=$?
+    box_chain_dns_active ip6tables nat NAT_DNS_HIJACK6; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
-    box_chain_dns_active ip6tables nat NAT_DNS_FORWARD; rc=$?
+    box_chain_dns_active ip6tables nat NAT_DNS_FORWARD6; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_chain_dns_active ip6tables mangle BOX_LOCAL; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
