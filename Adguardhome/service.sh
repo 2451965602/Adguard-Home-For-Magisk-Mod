@@ -173,14 +173,16 @@ else
     exec "$0"
 fi
 
-# 启动模块附加脚本
-"$SCRIPT_DIR/iptables.sh" &
+# 启动模块附加脚本（后台子进程重定向 fd，避免 service.sh 挂在管道等待）
+"$SCRIPT_DIR/iptables.sh" >/dev/null 2>&1 &
 "$SCRIPT_DIR/ModuleMOD.sh"
-"$SCRIPT_DIR/NoAdsService.sh" &
-"$SCRIPT_DIR/ProxyConfig.sh" &
+"$SCRIPT_DIR/NoAdsService.sh" >/dev/null 2>&1 &
+"$SCRIPT_DIR/ProxyConfig.sh" >/dev/null 2>&1 &
 
 # 执行脚本防篡改保护
 find "$ADGPATH" -type f -name "*.sh" -exec chattr +i {} \;
 
 # 日志超限时清空
 [ "$(wc -c < "$MAIN_LOG")" -ge 102400 ] && : > "$MAIN_LOG"
+
+exit 0

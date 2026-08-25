@@ -14,11 +14,30 @@ AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9
 # 也不依赖 pgrep -f——它会误计命令替换 fork 的子进程，且开机早期可能不可用）。
 LOCK_DIR="/data/adb/agh/.iptables.lock"
 if [ -d "$LOCK_DIR" ]; then
-    # 超过 2 小时视为残留锁（本脚本守护周期 60 秒），强制清除
-    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +120 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+    # PID 存活检测：检查锁持有者是否还活着（SIGKILL 不触发 trap 时的兜底）。
+    # 比纯时间超时更精准：持有者一死就立即清锁，不用等 2 小时。
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    lock_alive=0
+    case "$lock_pid" in
+        ''|*[!0-9]*)
+            # 无效 PID（旧版锁或损坏）→ 落入时间超时检查
+            ;;
+        *)
+            # 检查 PID 对应的进程是否存活且确实是 iptables.sh
+            lock_cmd=$(tr '\000' ' ' < "/proc/${lock_pid}/cmdline" 2>/dev/null)
+            case "$lock_cmd" in *iptables.sh*) lock_alive=1 ;; esac
+            ;;
+    esac
+    if [ "$lock_alive" -eq 1 ]; then
+        # 持有者还活着 → 本实例退出
+        exit
+    fi
+    # 持有者已死或 PID 无效 → 清理残留锁
+    rm -rf "$LOCK_DIR"
 fi
 mkdir "$LOCK_DIR" 2>/dev/null || exit
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 # shellcheck disable=SC2154
 ensure_ipv4_rules() {

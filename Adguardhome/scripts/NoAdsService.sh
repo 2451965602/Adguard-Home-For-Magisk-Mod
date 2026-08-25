@@ -3,11 +3,29 @@
 # 且开机早期 KernelSU 环境下 pgrep 可能不可用，两种情况都会误判）。
 LOCK_DIR="/data/adb/agh/.noads.lock"
 if [ -d "$LOCK_DIR" ]; then
-    # 超过 25 小时视为残留锁（本脚本主循环周期 1 小时），强制清除
-    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1500 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+    # PID 存活检测：检查锁持有者是否还活着（SIGKILL 不触发 trap 时的兜底）。
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    lock_alive=0
+    case "$lock_pid" in
+        ''|*[!0-9]*)
+            # 无效 PID（旧版锁或损坏）→ 清理残留锁
+            ;;
+        *)
+            # 检查 PID 对应的进程是否存活且确实是 NoAdsService.sh
+            lock_cmd=$(tr '\000' ' ' < "/proc/${lock_pid}/cmdline" 2>/dev/null)
+            case "$lock_cmd" in *NoAdsService.sh*) lock_alive=1 ;; esac
+            ;;
+    esac
+    if [ "$lock_alive" -eq 1 ]; then
+        # 持有者还活着 → 本实例退出
+        exit
+    fi
+    # 持有者已死或 PID 无效 → 清理残留锁
+    rm -rf "$LOCK_DIR"
 fi
 mkdir "$LOCK_DIR" 2>/dev/null || exit
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 # 广告屏蔽核心函数
 block_ad() {
