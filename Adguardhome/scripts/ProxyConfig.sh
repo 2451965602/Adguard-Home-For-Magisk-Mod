@@ -52,7 +52,7 @@ restart_service() {
     done
 }
 
-# 严格跟踪顶层 dns 块和四个直接列表键。
+# 严格跟踪顶层 dns 块和受管的直接列表键。
 dns_transform() {
     transform_mode=$1
     transform_file=$2
@@ -61,9 +61,9 @@ dns_transform() {
     awk -v mode="$transform_mode" -v port="$redir_port" '
         function top(line) { return line ~ /^[^[:space:]#][^:]*:/ }
         # dns 块内 4 空格直接列表 section
-        # proxy-server-nameserver 不管理：其语义是解析代理节点域名，必须独立于
-        # 代理链路（注入 AGH 会形成 节点域名→AGH→DoH域名→代理→节点 的死锁）。
-        # 旧版注入的 AGH 项会在 process/clean 时被移除，由用户手动维护。
+        # default-nameserver 和 proxy-server-nameserver 不注入 AGH：前者负责 DNS
+        # 上游引导解析，后者负责代理节点解析，两者必须独立于代理链路以避免死锁。
+        # default-nameserver 仍作为 target 跟踪，仅用于迁移旧版注入并保留用户配置。
         function dns_target(k) { return k == "direct-nameserver" || k == "nameserver" || k == "default-nameserver" }
         # sniffer 块内 4 空格直接列表 section
         function sniffer_target(k) { return k == "skip-domain" }
@@ -132,7 +132,7 @@ dns_transform() {
             # 在 END 段计算（扫描阶段 raw[NR+1] 尚未读入）
             for (i = 1; i <= NR; i++) {
                 s = section[i]
-                if (s == "") continue
+                if (s == "" || s == "dns:default-nameserver") continue
                 l = raw[i]
                 is_active_dns = active_dns_marker(l)
                 is_active_sniffer = active_sniffer_marker(l)
@@ -143,19 +143,24 @@ dns_transform() {
             }
             # 直接列表 section：对所有 seen_target 检查有效配对
             for (tid in seen_target) {
+                if (tid == "dns:default-nameserver") continue
                 if (!valid_managed_pair[tid] || has_other[tid]) need = 1
             }
             # marker 配对端口校验：active marker 紧邻 managed localhost 但端口非当前则 need
             for (i = 1; i <= NR; i++) {
                 l = raw[i]
                 s = section[i]
-                if (s == "") continue
+                if (s == "" || s == "dns:default-nameserver") continue
                 is_active_dns = active_dns_marker(l)
                 is_active_sniffer = active_sniffer_marker(l)
                 if ((s ~ /^dns:/ && is_active_dns) || (s ~ /^sniffer:/ && is_active_sniffer)) {
                     n = raw[i + 1]
                     if (managed_local_item(n) && !current_local_item(n)) need = 1
                 }
+            }
+            # default-nameserver 仅在发现旧版 marker 时触发迁移。
+            for (i = 1; i <= NR; i++) {
+                if (section[i] == "dns:default-nameserver" && dns_marker(raw[i])) need = 1
             }
             if (has_dns_list && !has_enhanced) need = 1
             if (mode == "check") exit need ? 1 : 0
@@ -184,7 +189,7 @@ dns_transform() {
                     continue
                 }
                 # dns 列表 marker 处理（命名空间隔离：仅 dns:* section）
-                if (s ~ /^dns:/ && dns_marker(l)) {
+                if (s ~ /^dns:/ && s != "dns:default-nameserver" && dns_marker(l)) {
                     n = raw[i + 1]
                     if (managed_local_item(n)) {
                         if (mode == "process") {
@@ -227,6 +232,19 @@ dns_transform() {
                     print l
                     continue
                 }
+                # default-nameserver 迁移：丢弃旧版 AGH 注入，恢复其关联的原始项。
+                if (s == "dns:default-nameserver" && dns_marker(l)) {
+                    n = raw[i + 1]
+                    if (managed_local_item(n)) { i++; continue }
+                    if (l ~ /disabled/ && n ~ /^    #[[:space:]]*-[[:space:]]+/) {
+                        restored = n
+                        sub(/^    #[[:space:]]*/, "    ", restored)
+                        print restored
+                        i++
+                        continue
+                    }
+                    continue
+                }
                 # proxy-server-nameserver 迁移清理：移除旧版注入的 marker+127.0.0.1:port
                 # 配对；disabled marker 关联的注释行恢复为活动项。其余 psn 段行原样
                 # 输出（该 section 由用户手动维护，不在管理范围）。
@@ -248,7 +266,7 @@ dns_transform() {
                     continue
                 }
                 # 直接列表项处理（dns + sniffer）
-                if (s != "" && list_item(l)) {
+                if (s != "" && s != "dns:default-nameserver" && list_item(l)) {
                     if (mode == "clean") {
                         print l
                         continue
@@ -271,6 +289,11 @@ dns_transform() {
                         print mk
                         print "    # " substr(l, 5)
                     }
+                    continue
+                }
+                # default-nameserver 由用户维护，不注入 AGH。
+                if (s == "dns:default-nameserver" && list_item(l)) {
+                    print l
                     continue
                 }
                 print l
