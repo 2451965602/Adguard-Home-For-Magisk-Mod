@@ -84,6 +84,13 @@ iptables -w 2 -t nat -X AGHMOD_DNS4 >/dev/null 2>&1
 while ip6tables -w 2 -D OUTPUT -j AGHMOD_DNS6 >/dev/null 2>&1; do :; done
 ip6tables -w 2 -F AGHMOD_DNS6 >/dev/null 2>&1
 ip6tables -w 2 -X AGHMOD_DNS6 >/dev/null 2>&1
+# DoT(853) 阻断链（filter 表）
+while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT4 >/dev/null 2>&1; do :; done
+iptables -w 2 -t filter -F AGHMOD_DOT4 >/dev/null 2>&1
+iptables -w 2 -t filter -X AGHMOD_DOT4 >/dev/null 2>&1
+while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1; do :; done
+ip6tables -w 2 -t filter -F AGHMOD_DOT6 >/dev/null 2>&1
+ip6tables -w 2 -t filter -X AGHMOD_DOT6 >/dev/null 2>&1
 
 i18n_print "- Extracting basic module files" "- 正在解压模块基本文件"
 for file in uninstall.sh module.prop service.sh action.sh; do
@@ -156,9 +163,15 @@ chown root:net_raw "$BIN_DIR/AdGuardHome"
 i18n_print "- Locking script files" "- 正在锁定脚本文件"
 find "$SCRIPT_DIR" -type f -name "*.sh" -exec chattr +i {} \;
 
-# 正在保留配置文件
+# 正在保留配置文件：只恢复 PROXY_URL（吸收自上游 20260829）。
+# 全量覆盖会把旧版 config.prop 回退到新安装包（redir_port 等以新包为准，
+# 服务启动时 service.sh 会重写 redir_port），仅订阅链接是用户资产必须保留。
 if [ -f "$BACKUP_DIR/config.prop" ]; then
-  i18n_print "- Preserving configuration file" "- 正在保留配置文件"
-  cp -f "$BACKUP_DIR/config.prop" "$SCRIPT_DIR/"
+  old_line=$(grep -m1 '^PROXY_URL=' "$BACKUP_DIR/config.prop")
+  if [ -n "$old_line" ]; then
+    sed -i "/^PROXY_URL=/d" "$SCRIPT_DIR/config.prop"
+    printf '%s\n' "$old_line" >> "$SCRIPT_DIR/config.prop"
+    i18n_print "- Preserved PROXY_URL from backup" "- 已从备份恢复 PROXY_URL"
+  fi
 fi
 i18n_print "- Installation complete. Reboot device." "- 安装完成，请重启设备。"

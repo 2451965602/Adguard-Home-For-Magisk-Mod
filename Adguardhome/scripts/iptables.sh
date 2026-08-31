@@ -84,6 +84,53 @@ rules6_are_valid() {
     ip6tables -w 2 -C AGHMOD_DNS6 -p tcp --dport 53 -j DROP >/dev/null 2>&1
 }
 
+# ===== DoT(853) 阻断链（filter 表）=====
+# 目的：阻断普通应用的 DoT 流量，防止 DNS 绕过 AGH（吸收自上游 20260829）。
+# 与上游的差异：带 root 豁免（--uid-owner root RETURN）——mihomo/AGH 等代理与
+# DNS 内核均以 root 运行且需要 DoT 能力；配套 box 规则约定"仅禁止非 mihomo
+# 访问 DoT"，filter OUTPUT 维度与之对齐（PROCESS-NAME 粒度由 box 侧实现）。
+ensure_dot4_rules() {
+    iptables -w 2 -t filter -L AGHMOD_DOT4 >/dev/null 2>&1 || \
+        iptables -w 2 -t filter -N AGHMOD_DOT4 || return 1
+    iptables -w 2 -t filter -F AGHMOD_DOT4 || return 1
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -I OUTPUT -j AGHMOD_DOT4 || return 1
+    iptables -w 2 -t filter -A AGHMOD_DOT4 -m owner --uid-owner root \
+        -j RETURN || return 1
+    iptables -w 2 -t filter -A AGHMOD_DOT4 -p tcp --dport 853 -j DROP || return 1
+    iptables -w 2 -t filter -A AGHMOD_DOT4 -p udp --dport 853 -j DROP || return 1
+}
+
+ensure_dot6_rules() {
+    ip6tables -w 2 -t filter -L AGHMOD_DOT6 >/dev/null 2>&1 || \
+        ip6tables -w 2 -t filter -N AGHMOD_DOT6 || return 1
+    ip6tables -w 2 -t filter -F AGHMOD_DOT6 || return 1
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -I OUTPUT -j AGHMOD_DOT6 || return 1
+    ip6tables -w 2 -t filter -A AGHMOD_DOT6 -m owner --uid-owner root \
+        -j RETURN || return 1
+    ip6tables -w 2 -t filter -A AGHMOD_DOT6 -p tcp --dport 853 -j DROP || return 1
+    ip6tables -w 2 -t filter -A AGHMOD_DOT6 -p udp --dport 853 -j DROP || return 1
+}
+
+dot4_rules_valid() {
+    iptables -w 2 -t filter -L AGHMOD_DOT4 >/dev/null 2>&1 && \
+    iptables -w 2 -t filter -C OUTPUT -j AGHMOD_DOT4 >/dev/null 2>&1 && \
+    iptables -w 2 -t filter -C AGHMOD_DOT4 -m owner --uid-owner root \
+        -j RETURN >/dev/null 2>&1 && \
+    iptables -w 2 -t filter -C AGHMOD_DOT4 -p tcp --dport 853 -j DROP >/dev/null 2>&1 && \
+    iptables -w 2 -t filter -C AGHMOD_DOT4 -p udp --dport 853 -j DROP >/dev/null 2>&1
+}
+
+dot6_rules_valid() {
+    ip6tables -w 2 -t filter -L AGHMOD_DOT6 >/dev/null 2>&1 && \
+    ip6tables -w 2 -t filter -C OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1 && \
+    ip6tables -w 2 -t filter -C AGHMOD_DOT6 -m owner --uid-owner root \
+        -j RETURN >/dev/null 2>&1 && \
+    ip6tables -w 2 -t filter -C AGHMOD_DOT6 -p tcp --dport 853 -j DROP >/dev/null 2>&1 && \
+    ip6tables -w 2 -t filter -C AGHMOD_DOT6 -p udp --dport 853 -j DROP >/dev/null 2>&1
+}
+
 # 检测 box 是否在指定表/链中接管了 DNS（UDP/TCP 53）。
 # $1=iptables 二进制  $2=表  $3=链名
 # 返回三态：0=active（box 接管），1=inactive（box 未接管），2=unknown（检测失败）。
@@ -150,6 +197,20 @@ cleanup_agh6_rules() {
     ip6tables -w 2 -X AGHMOD_DNS6 >/dev/null 2>&1
 }
 
+# 清理 DoT(853) 阻断链（幂等）。与 DNS 劫持链不同：DoT 阻断不与 box 冲突
+# （box 不创建 filter 表 OUTPUT 的 853 规则），box 接管期间仍保持生效。
+cleanup_dot4_rules() {
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -F AGHMOD_DOT4 >/dev/null 2>&1
+    iptables -w 2 -t filter -X AGHMOD_DOT4 >/dev/null 2>&1
+}
+
+cleanup_dot6_rules() {
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -F AGHMOD_DOT6 >/dev/null 2>&1
+    ip6tables -w 2 -t filter -X AGHMOD_DOT6 >/dev/null 2>&1
+}
+
 # AGH 进程健康检查：仅记日志警告，不拉起（生命周期由 service.sh 管理）。
 # 不用 pgrep 判存活：开机早期 KernelSU 环境下 pgrep 可能不可用（返回 127 被
 # 误判为进程不存在），导致每 60 秒刷一条误报警告。以 redir_port 端口监听为准。
@@ -166,6 +227,11 @@ warn_if_agh_down() {
 
 # 规则守护循环
 while true; do
+    # 每轮重读 yaml 端口真相源（吸收自上游"每轮重读配置"的思想）：
+    # service.sh 重试循环会随机化新端口并重启 AGH，本守护进程因锁持续存活，
+    # 内存中的 redir_port 会过期——不重读就会把 DNS 重定向到死端口。
+    AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9]+/{print $2; exit}' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null)
+    [ -n "$AGH_YAML_PORT" ] && redir_port="$AGH_YAML_PORT"
     warn_if_agh_down
     # IPv4 和 IPv6 独立检测：box 可能只接管其中一栈。
     # 三态：0=active（清理 AGH），1=inactive（安装/维护 AGH），2=unknown（跳过本轮）。
@@ -179,5 +245,8 @@ while true; do
         0) cleanup_agh6_rules ;;
         1) rules6_are_valid || { ensure_ipv6_rules || :; } ;;
     esac
+    # DoT(853) 阻断独立维护：不依赖 box 接管状态，规则缺失即补齐。
+    dot4_rules_valid || { ensure_dot4_rules || :; }
+    dot6_rules_valid || { ensure_dot6_rules || :; }
     sleep 60
 done

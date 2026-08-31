@@ -44,6 +44,14 @@ while ip6tables -w 2 -D OUTPUT -j AGHMOD_DNS6 >/dev/null 2>&1; do :; done
 ip6tables -w 2 -F AGHMOD_DNS6 >/dev/null 2>&1
 ip6tables -w 2 -X AGHMOD_DNS6 >/dev/null 2>&1
 
+# 清理 DoT(853) 阻断链（filter 表）。
+while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT4 >/dev/null 2>&1; do :; done
+iptables -w 2 -t filter -F AGHMOD_DOT4 >/dev/null 2>&1
+iptables -w 2 -t filter -X AGHMOD_DOT4 >/dev/null 2>&1
+while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1; do :; done
+ip6tables -w 2 -t filter -F AGHMOD_DOT6 >/dev/null 2>&1
+ip6tables -w 2 -t filter -X AGHMOD_DOT6 >/dev/null 2>&1
+
 # 停止 NoAdsService 和 ProxyConfig：TERM 后等待确认，必要时 KILL。
 stop_module_process() {
     pkill -TERM -f "$1" 2>/dev/null

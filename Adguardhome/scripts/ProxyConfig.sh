@@ -490,6 +490,12 @@ process_configs() {
 }
 
 while :; do
+    # 每轮重读配置（吸收自上游 20260829）：config.prop 可能被 customize.sh
+    # 在备份恢复或用户手动修改后更新，重读使 PROXY_URL/redir_port 变更免重启生效。
+    # shellcheck disable=SC1090
+    [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+    # PROXY_URL 归一化值随之刷新。
+    PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
     retry_soon=0
     process_configs box_bll "$1"
     process_configs box "$1"

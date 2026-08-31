@@ -234,9 +234,20 @@ scan_ads() {
    block_ad "/data/data/com.ihandy.fund/cache/image_manager_disk_cache"
    block_ad "/data/media/0/Android/data/com.ihandy.fund/cache/download/splash"
    
-   # 中国移动云盘
-   block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/M_Cloud/temp/bigcloudimage"
-   block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/boot_logo"
+    # 中国移动云盘
+    block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/M_Cloud/temp/bigcloudimage"
+    block_ad "/data/media/0/Android/data/com.chinamobile.mcloud/files/boot_logo"
+
+    # 建信基金
+    block_ad "/data/data/com.ccb.zzb.activity/files/image"
+
+    # 大学搜题酱
+    block_ad "/data/media/0/Android/data/com.zmzx.college.search/cache/glide"
+
+    # 汽水音乐
+    block_ad "/data/media/0/com.luna.music/cache/image_commercial_cache"
+    block_ad "/data/media/0/com.luna.music/cache/pangle_com.byted.pangle"
+    block_ad "/data/media/0/com.luna.music/files/splashCache"
 
 }
 
@@ -249,11 +260,15 @@ while :; do
     # 自动关闭私人DNS
     [ "$(settings get global private_dns_mode)" = "off" ] || settings put global private_dns_mode off
 
-    # 自动清空IFW文件夹
+    # IFW 文件夹改用锁定方式（吸收自上游 20260829）：chattr +i 后系统无法
+    # 写入新规则，免去每小时的清空轮询，更省电。降级兜底：属性工具不可用时
+    # 仍按小时清空。
     if [ -d "/data/system/ifw" ]; then
-        for f in /data/system/ifw/*; do
-            [ -e "$f" ] && rm -rf /data/system/ifw/* && break
-        done
+        if ! block_ad "/data/system/ifw"; then
+            for f in /data/system/ifw/*; do
+                [ -e "$f" ] && rm -rf /data/system/ifw/* && break
+            done
+        fi
     fi
 
     # 专清 /data/data 中符合 AOSP installd 命名的卸载残留。
