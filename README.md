@@ -14,93 +14,111 @@
 
 ## 模块架构设计图
 ```mermaid
-flowchart TD
-    subgraph 开机启动
-        A[Magisk 触发 service.sh] --> B[解锁脚本 chattr -i]
-        B --> C[检测 hosts 模块冲突]
-        C -->|有冲突| D[标记移除并退出]
-        C -->|无冲突| E[动态随机化端口]
-        E --> F[修改 AdGuardHome.yaml 和 config.prop]
-        F --> G[启动 AdGuardHome 二进制]
-        G --> H[验证进程是否存在]
-        H -->|失败| I[exec service.sh 自重启]
-        H -->|成功| J[后台启动子脚本]
+graph TD
+    subgraph 独立管理器[独立管理器 - adguard-home-manager-mod]
+        M1[Flutter 应用<br>arm64-v8a] --> M2[自动读取 YAML<br>获取随机管理端口]
+        M2 --> M3[使用 root/root 凭证<br>连接 AGH API]
+        M3 --> M4[首页：全部保护开关<br>暂停时长选择]
+        M3 --> M5[日志·统计·DNS配置]
+        M3 --> M6[订阅链接 PROXY_URL<br>写入 config.prop]
+        M1 --> M7[通知栏快捷磁贴开关]
+        M1 --> M8[开机自启动 MainActivity]
     end
 
-    subgraph 常驻守护循环
-        J --> K[iptables.sh]
-        J --> L[NoAdsService.sh]
-        J --> M[ProxyConfig.sh]
-        J --> N[ModuleMOD.sh]
-        
-        K --> K1[每5秒检查 iptables 规则和 AGH 进程]
-        K1 -->|规则丢失| K2[重建规则并切换飞行模式]
-        K1 -->|AGH 丢失| K3[重启 AdGuardHome]
-        
-        L --> L1[每5秒收集广告目录路径]
-        L1 --> L2[批量 lsattr 检查已锁定]
-        L2 -->|未锁定| L3[rm -rf → mkdir → chattr +i 锁定]
-        L2 -->|已锁定| L4[跳过]
-        L1 --> L5[强制关闭私有 DNS]
-        L1 --> L6[清理 IFW 目录]
-        L1 --> L7[清理卸载残留]
-        
-        M --> M1[每5秒循环处理代理配置文件]
-        M1 --> M2[检查是否为标准配置]
-        M2 -->|非标准| M3[修改 YAML 中的 DNS 指向 AGH]
-        M3 --> M4[重启对应代理服务并刷新网络]
-        M2 -->|标准| M5[跳过]
-        
-        N --> N1[每5秒检测系统语言]
-        N1 -->|变化| N2[更新 module.prop 描述]
-        N1 -->|不变| N3[跳过]
+    subgraph 安装流程[安装流程 - customize.sh]
+        I1[开始安装] --> I2[检测Hosts模块冲突]
+        I2 --> I3[停止旧进程·备份配置]
+        I3 --> I4[解压文件·设置权限]
+        I4 --> I5[锁定脚本 chattr +i]
+        I5 --> I6[安装完成，提示重启]
     end
 
-    subgraph 配置与数据
-        P[config.prop] -->|提供 redir_port| M
-        P -->|提供 redir_port| K
-        Q[AdGuardHome.yaml] -->|端口配置| G
-        R[AGH 进程] -.->|pgrep 监控| K
+    subgraph 启动主流程[启动主流程 - service.sh]
+        S1[service.sh 执行] --> S2[解锁脚本防篡改]
+        S2 --> S3{检测到Hosts模块?}
+        S3 -->|有| S4[禁用模块并退出]
+        S3 -->|无| S5{AGH进程是否已运行?}
+        S5 -->|是（软重启）| S6[跳过初始化]
+        S5 -->|否（冷启动）| S7[随机化端口·修改配置]
+        S7 --> S8[启动AGH]
+        S8 --> S9{启动验证成功?}
+        S9 -->|是| S10[记录启动成功]
+        S9 -->|否| S11[exec $0 自重启]
+        S11 --> S1
+        S10 --> S12[启动守护脚本组]
+        S6 --> S12
     end
 
-    subgraph 外部交互
-        S[用户点击 action.sh] --> T[提取 Web UI 端口]
-        T --> U[am start 打开浏览器]
-        V[独立管理器 APK] --> W[读取 config.prop 和 YAML]
-        W --> X[显示状态并控制模块]
+    subgraph 守护脚本组[守护脚本组 - 各自独立5秒循环]
+        DIR[<b>各自独立 每5秒循环</b>]
+
+        D1["iptables.sh"]
+        D1 --> D1A[每轮重载 config.prop]
+        D1A --> D1B{检测 need_restart<br>（pgrep AGH）}
+        D1B -->|进程丢失| D1C[start_agh：写日志·启动AGH]
+        D1B -->|进程正常| D1D[继续]
+        D1C --> D1E[检测 need_fix<br>（规则检查）]
+        D1D --> D1E
+        D1E -->|规则异常| D1F[rebuild_rules：重建规则·刷新网络]
+        D1E -->|规则正常| D1G[sleep 5 回到循环]
+        D1F --> D1G
+        D1G --> D1
+
+        D2["NoAdsService.sh"]
+        D2 --> D2A[收集广告目录路径]
+        D2A --> D2B[检查锁定状态]
+        D2B -->|未锁定| D2C[删除目录·重建并锁定]
+        D2B -->|已锁定| D2D[跳过]
+        D2C --> D2E[强制关闭私人DNS]
+        D2D --> D2E
+        D2E --> D2F[sleep 5 回到循环]
+        D2F --> D2
+
+        D3["ProxyConfig.sh"]
+        D3 --> D3A[每轮重载 config.prop]
+        D3A --> D3B[遍历代理配置文件]
+        D3B --> D3C[修改YAML DNS指向AGH]
+        D3C --> D3D[重启代理服务·刷新网络]
+        D3D --> D3E[sleep 5 回到循环]
+        D3E --> D3
+
+        D4["ModuleMOD.sh"]
+        D4 --> D4A[检测系统语言]
+        D4A --> D4B{语言是否变化?}
+        D4B -->|是| D4C[更新 module.prop 描述]
+        D4B -->|否| D4D[跳过]
+        D4C --> D4E[sleep 5 回到循环]
+        D4D --> D4E
+        D4E --> D4
     end
 
-    subgraph 安装流程
-        direction TB
-        I1[开始安装] --> I2[检测 hosts 模块冲突]
-        I2 -->|有冲突| I3[标记移除并提示重启]
-        I2 -->|无冲突| I4[停止旧进程]
-        I4 --> I5[解锁旧脚本 chattr -i]
-        I5 --> I6[删除被锁定的残留文件]
-        I6 --> I7[备份旧配置]
-        I7 --> I8[解压新文件并设置权限]
-        I8 --> I9[恢复 PROXY_URL 原子迁移]
-        I9 --> I10[锁定脚本 chattr +i]
-        I10 --> I11[安装完成，提示重启]
+    subgraph 卸载流程[卸载流程 - uninstall.sh]
+        U1[开始卸载] --> U2[遍历 /proc 停止所有 AGH 及脚本进程]
+        U2 --> U3[ProxyConfig --clean 还原代理配置]
+        U3 --> U4[清理 iptables 规则]
+        U4 --> U5[解锁 chattr 并删除残留文件]
+        U5 --> U6[删除 AGH 残留目录]
+        U6 --> U7[卸载完成，无残留]
     end
 
-    subgraph 卸载流程
-        direction TB
-        U1[开始卸载] --> U2[停止所有进程 pkill]
-        U2 --> U3[还原第三方代理配置]
-        U3 --> U4[解锁所有 chattr 文件]
-        U4 --> U5[删除 $AGH_DIR 和 $ADGPATH]
-        U5 --> U6[卸载完成，无残留]
-    end
+    %% 垂直顺序：管理器 → 安装 → 启动 → 守护 → 卸载
+    独立管理器 -.->|可选工具，读取/写入配置| 安装流程
+    安装流程 --> 启动主流程
+    启动主流程 --> 守护脚本组
+    守护脚本组 --> 卸载流程
 
-    style A fill:#f9f,stroke:#333
-    style G fill:#bbf,stroke:#333
-    style K fill:#bfb,stroke:#333
-    style L fill:#bfb,stroke:#333
-    style M fill:#bfb,stroke:#333
-    style N fill:#bfb,stroke:#333
-    style I1 fill:#ffa,stroke:#333
-    style U1 fill:#faa,stroke:#333
+    style S5 fill:#f9f,stroke:#333
+    style S6 fill:#bbf,stroke:#333
+    style S7 fill:#bbf,stroke:#333
+    style S11 fill:#faa,stroke:#333
+    style D1 fill:#e1f5e1,stroke:#333
+    style D2 fill:#e1f0f5,stroke:#333
+    style D3 fill:#f5e1e1,stroke:#333
+    style D4 fill:#f5f0e1,stroke:#333
+    style DIR fill:#fff,stroke:#fff
+    style M1 fill:#e8d5f5,stroke:#333
+    style M7 fill:#d5f5e8,stroke:#333
+    style M8 fill:#d5f5e8,stroke:#333
 ```
 
 ## ⚠️ 风险提示，不看请别怪我没提醒
