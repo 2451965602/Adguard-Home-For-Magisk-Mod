@@ -249,6 +249,8 @@ scan_ads() {
     block_ad "/data/media/0/com.luna.music/cache/pangle_com.byted.pangle"
     block_ad "/data/media/0/com.luna.music/files/splashCache"
 
+    # Coolapk
+    block_ad "/data/data/com.coolapk.market/app_adnet/"
 }
 
 # 开机立即执行一次完整广告路径扫描。
