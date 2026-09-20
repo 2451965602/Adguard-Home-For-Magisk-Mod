@@ -134,23 +134,44 @@ dot6_rules_valid() {
 # 检测 box 是否在指定表/链中接管了 DNS（UDP/TCP 53）。
 # $1=iptables 二进制  $2=表  $3=链名
 # 返回三态：0=active（box 接管），1=inactive（box 未接管），2=unknown（检测失败）。
-# 用 -S OUTPUT | grep 捕获带条件的跳转（如 -p udp -j chain）。
-# 链内规则用管道确认同一行同时含 --dport 53 和 -j REDIRECT|MARK|TPROXY。
+# 用 -S 检查 OUTPUT/PREROUTING 中的跳转（如 -p udp -j chain）。
+# 链内规则用管道确认同一行同时含 --dport 53 和 DNS 接管 target。
 box_chain_dns_active() {
     ipt_cmd=$1
     table=$2
     chain=$3
-    # OUTPUT 是否跳转到该链（含带条件跳转，-C 无法匹配此类规则）。
-    out_rules=$("$ipt_cmd" -w 2 -t "$table" -S OUTPUT 2>/dev/null)
-    out_rc=$?
-    [ $out_rc -ne 0 ] && return 2
-    echo "$out_rules" | grep -qE -- "-j[[:space:]]+${chain}([[:space:]]|$)" || return 1
-    # 链内是否存在 53 端口的 DNS 接管规则（同一行须同时含两个条件）。
-    chain_rules=$("$ipt_cmd" -w 2 -t "$table" -S "$chain" 2>/dev/null)
-    chain_rc=$?
-    [ $chain_rc -ne 0 ] && return 2
-    echo "$chain_rules" | grep -E -- "--dport[[:space:]]+53([[:space:]]|$)" | \
-        grep -qE -- "-j[[:space:]]+(REDIRECT|MARK|TPROXY)([[:space:]]|$)" && return 0
+    chain_seen=0
+    for hook in OUTPUT PREROUTING; do
+        # -C 无法匹配带条件跳转，使用 -S 保留完整规则文本。
+        hook_rules=$("$ipt_cmd" -w 2 -t "$table" -S "$hook" 2>/dev/null)
+        hook_rc=$?
+        [ $hook_rc -ne 0 ] && return 2
+        echo "$hook_rules" | grep -qE -- "-j[[:space:]]+${chain}([[:space:]]|$)" || continue
+        chain_seen=1
+        # 链内规则须同时含 53 端口和 DNS 接管 target。
+        chain_rules=$("$ipt_cmd" -w 2 -t "$table" -S "$chain" 2>/dev/null)
+        chain_rc=$?
+        [ $chain_rc -ne 0 ] && return 2
+        echo "$chain_rules" | grep -E -- "--dport[[:space:]]+53([[:space:]]|$)" | \
+            grep -qE -- "-j[[:space:]]+(REDIRECT|DNAT|MARK|TPROXY)([[:space:]]|$)" && return 0
+    done
+    [ $chain_seen -eq 0 ] || return 1
+    return 1
+}
+
+# TUN 模式可能直接在 mangle hook 上对 DNS 使用 TPROXY，而不经过 BOX_LOCAL。
+# 同样返回 active/inactive/unknown 三态；两个 hook 任一失败都不擅自改动 AGH 规则。
+box_tun_dns_active() {
+    ipt_cmd=$1
+    saw_rule=0
+    for hook in OUTPUT PREROUTING; do
+        mangle_rules=$("$ipt_cmd" -w 2 -t mangle -S "$hook" 2>/dev/null)
+        mangle_rc=$?
+        [ $mangle_rc -ne 0 ] && return 2
+        echo "$mangle_rules" | grep -E -- "--dport[[:space:]]+53([[:space:]]|$)" | \
+            grep -qE -- "-j[[:space:]]+TPROXY([[:space:]]|$)" && saw_rule=1
+    done
+    [ $saw_rule -eq 1 ] && return 0
     return 1
 }
 
@@ -163,6 +184,8 @@ box_dns4_active() {
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_chain_dns_active iptables mangle BOX_LOCAL; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+    box_tun_dns_active iptables; rc=$?
+    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     [ $saw_unknown -eq 1 ] && return 2
     return 1
 }
@@ -173,14 +196,26 @@ box_dns4_active() {
 # miss，此时 AGH 抢挂 nat REDIRECT 是预期接管行为：本机 DNS 进 AGH 而非 mihomo。
 box_dns6_active() {
     saw_unknown=0
+    # 不同 Box 版本对 IPv6 链名有无 6 后缀两种实现，均保守识别。
+    box_chain_dns_active ip6tables nat NAT_DNS_HIJACK; rc=$?
+    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+    box_chain_dns_active ip6tables nat NAT_DNS_FORWARD; rc=$?
+    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_chain_dns_active ip6tables nat NAT_DNS_HIJACK6; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_chain_dns_active ip6tables nat NAT_DNS_FORWARD6; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_chain_dns_active ip6tables mangle BOX_LOCAL; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+    box_tun_dns_active ip6tables; rc=$?
+    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     [ $saw_unknown -eq 1 ] && return 2
     return 1
+}
+
+log_box_dns_unknown() {
+    box_family=$1
+    echo "$(date '+%F %T') [WARN] Box IPv${box_family} DNS takeover detection unknown; skip AGH DNS rule changes" >> "$MAIN_LOG"
 }
 
 # 清理 AGH IPv4 DNS 劫持链（幂等）。
@@ -239,11 +274,15 @@ while true; do
     case $v4_rc in
         0) cleanup_agh4_rules ;;
         1) rules4_are_valid || { ensure_ipv4_rules || :; } ;;
+        # unknown 时宁可放弃 AGH 接管，也不能让旧 AGH 规则继续抢占 53。
+        2) cleanup_agh4_rules; log_box_dns_unknown 4 ;;
     esac
     box_dns6_active; v6_rc=$?
     case $v6_rc in
         0) cleanup_agh6_rules ;;
         1) rules6_are_valid || { ensure_ipv6_rules || :; } ;;
+        # unknown 时不安装新规则，并清掉已有 AGH IPv6 DNS 规则。
+        2) cleanup_agh6_rules; log_box_dns_unknown 6 ;;
     esac
     # DoT(853) 阻断独立维护：不依赖 box 接管状态，规则缺失即补齐。
     dot4_rules_valid || { ensure_dot4_rules || :; }

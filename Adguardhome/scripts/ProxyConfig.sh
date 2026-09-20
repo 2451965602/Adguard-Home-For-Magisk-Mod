@@ -30,8 +30,21 @@ trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
 # 端口真相源：AGH 实际加载的 AdGuardHome.yaml 中 dns.port。
 # config.prop 可能因 service.sh 重试循环漂移，yaml 才是运行实例的真实端口。
-AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9]+/{print $2; exit}' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null)
-[ -n "$AGH_YAML_PORT" ] && redir_port="$AGH_YAML_PORT"
+is_valid_port() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+load_agh_yaml_port() {
+    AGH_YAML_PORT=$(awk '/^dns:[[:space:]]*$/{f=1;next} f&&/^  port:[[:space:]]*[0-9]+/{print $2; exit}' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null)
+    is_valid_port "$AGH_YAML_PORT" || return 1
+    redir_port=$AGH_YAML_PORT
+    return 0
+}
+
+load_agh_yaml_port || :
 
 # 默认的单个空格代表未配置代理地址。
 PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
@@ -84,6 +97,13 @@ dns_transform() {
         # sniffer.skip-domain 任意 marker
         function sniffer_marker(line) { return active_sniffer_marker(line) || disabled_sniffer_marker(line) }
         function enhanced_marker(line) { return line ~ /^  #[[:space:]]*AdGuardHome managed enhanced-mode[|]/ }
+        # 缺失 direct-nameserver 时新增的完整受管 block marker。
+        function created_direct_marker(line) { return line ~ /^  #[[:space:]]*AdGuardHome managed direct-nameserver[[:space:]]*$/ }
+        function created_direct_block(i) {
+            return created_direct_marker(raw[i]) && \
+                raw[i + 1] ~ /^  direct-nameserver:[[:space:]]*$/ && \
+                active_dns_marker(raw[i + 2]) && managed_local_item(raw[i + 3])
+        }
         {
             raw[NR] = $0
             if (top($0)) {
@@ -114,6 +134,7 @@ dns_transform() {
             if (target_id != "") seen_target[target_id] = 1
             if (top_block == "dns" && $0 ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/)
                 has_enhanced = 1
+            if (top_block == "dns") has_dns_block = 1
             if (target_id != "" && list_item($0)) {
                 if (top_block == "dns") has_dns_list = 1
                 if (top_block == "sniffer") has_sniffer_list = 1
@@ -162,11 +183,29 @@ dns_transform() {
             for (i = 1; i <= NR; i++) {
                 if (section[i] == "dns:default-nameserver" && dns_marker(raw[i])) need = 1
             }
+            # direct-nameserver 是 AGH 直连 DNS 的配对项；缺失时在 dns 块末尾创建。
+            if (has_dns_block && !seen_target["dns:direct-nameserver"]) need = 1
             if (has_dns_list && !has_enhanced) need = 1
             if (mode == "check") exit need ? 1 : 0
             for (i = 1; i <= NR; i++) {
                 l = raw[i]
                 s = section[i]
+                # 缺少 direct-nameserver 时安全创建；在下一个顶层块前插入，
+                # 避免把 section 错放到 dns 块外。
+                if (mode == "process" && i > 1 && block[i - 1] == "dns" && top(l) &&
+                    !seen_target["dns:direct-nameserver"]) {
+                    print "  # AdGuardHome managed direct-nameserver"
+                    print "  direct-nameserver:"
+                    print "    # AdGuardHome managed DNS"
+                    print "    - 127.0.0.1:" port
+                    seen_target["dns:direct-nameserver"] = 1
+                }
+                # 删除本脚本新增的完整 direct-nameserver block；原本存在的 key
+                # 不带此 marker，继续走下方普通 marker/用户项恢复逻辑。
+                if (mode == "clean" && i + 3 <= NR && created_direct_block(i)) {
+                    i += 3
+                    continue
+                }
                 # enhanced-mode marker 处理（不变）
                 if (mode == "clean" && block[i] == "dns" && enhanced_marker(l) &&
                     i < NR && raw[i + 1] ~ /^  enhanced-mode:[[:space:]]*redir-host([[:space:]]*#.*)?$/) {
@@ -208,6 +247,15 @@ dns_transform() {
                     }
                     if (mode == "clean") continue
                     print l
+                    continue
+                }
+                # 已存在但为空的直接列表 section：在 key 后创建受管配对。
+                if (mode == "process" && (s == "dns:nameserver" || s == "dns:direct-nameserver") &&
+                    l ~ /^  [^[:space:]#][^:]*:/ && !valid_managed_pair[s] && !inserted[s]) {
+                    print l
+                    print "    # AdGuardHome managed DNS"
+                    print "    - 127.0.0.1:" port
+                    inserted[s] = 1
                     continue
                 }
                 # sniffer.skip-domain marker 处理
@@ -297,6 +345,13 @@ dns_transform() {
                     continue
                 }
                 print l
+            }
+            if (mode == "process" && has_dns_block && !seen_target["dns:direct-nameserver"] &&
+                block[NR] == "dns") {
+                print "  # AdGuardHome managed direct-nameserver"
+                print "  direct-nameserver:"
+                print "    # AdGuardHome managed DNS"
+                print "    - 127.0.0.1:" port
             }
         }
     ' "$transform_file"
@@ -493,6 +548,11 @@ process_configs() {
     esac
     need_restart=0
     # 修改 box 配置前确认 AGH 已运行，避免 box 重启后上游全部失效导致 DNS 中断。
+    if [ "$2" != "--clean" ] && ! is_valid_port "$AGH_YAML_PORT"; then
+        echo "$(date '+%F %T') [WARN] AdGuardHome.yaml dns.port 无效，跳过代理配置修改，30 秒后重试。" >> "$AGH_DIR/agh.log" 2>/dev/null
+        retry_soon=1
+        return 0
+    fi
     if [ "$2" != "--clean" ] && ! agh_ready && ! wait_agh_ready; then
         echo "$(date '+%F %T') [WARN] AdGuardHome 未就绪，跳过代理配置修改，30 秒后重试。" >> "$AGH_DIR/agh.log" 2>/dev/null
         retry_soon=1
@@ -517,6 +577,8 @@ while :; do
     # 在备份恢复或用户手动修改后更新，重读使 PROXY_URL/redir_port 变更免重启生效。
     # shellcheck disable=SC1090
     [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+    # 每轮以 yaml 的有效 dns.port 覆盖 config.prop，端口无效时 process_configs 拒绝改写。
+    load_agh_yaml_port || :
     # PROXY_URL 归一化值随之刷新。
     PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
     retry_soon=0
