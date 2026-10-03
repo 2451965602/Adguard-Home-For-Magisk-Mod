@@ -3,6 +3,7 @@ CONFIG_FILE="$(dirname "$0")/config.prop"
 AGH_DIR="$(dirname "$(dirname "$0")")"
 # shellcheck disable=SC1090
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+: "${random_dns_port:=yes}"
 
 # 单实例锁：mkdir 原子操作，不依赖 pgrep 进程名匹配
 # （shell 命令替换 fork 的子进程会复制 cmdline，pgrep 会误计自身实例）。
@@ -45,6 +46,25 @@ load_agh_yaml_port() {
 }
 
 load_agh_yaml_port || :
+
+# TLS 的 HTTPS 监听配置是本次运行的安全边界：启用 TLS 且配置有效 HTTPS
+# 端口时，不让本模块随机化/改写 Mihomo 的 DNS 配置。
+tls_runtime_fixed() {
+    awk '
+        /^[^[:space:]#][^:]*:/ {
+            block=$0
+            sub(/:.*/, "", block)
+        }
+        block == "tls" && /^  enabled:[[:space:]]*true([[:space:]]*#.*)?$/ { enabled=1 }
+        block == "tls" && /^  port_https:[[:space:]]*[0-9]+([[:space:]]*#.*)?$/ {
+            port=$2
+            sub(/[[:space:]#].*$/, "", port)
+        }
+        END { exit (enabled && port > 0) ? 0 : 1 }
+    ' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null
+}
+
+MODE_STATE_FILE="$AGH_DIR/.proxycfg-dns-mode"
 
 # 默认的单个空格代表未配置代理地址。
 PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
@@ -396,6 +416,58 @@ replace_config_file() {
     return 0
 }
 
+# 仅清理本模块留下的 DNS marker 配对。未标记的 DNS 项逐行原样保留，
+# 与完整 --clean 不同，这里不触碰用户的 proxy-provider URL。
+clean_dns_config() {
+    clean_target=$1
+    [ -f "$clean_target" ] || return 1
+    clean_tmp=$(mktemp "${clean_target}.tmp.XXXXXX") || return 2
+    dns_transform clean "$clean_target" > "$clean_tmp" || {
+        rm -f "$clean_tmp"
+        return 2
+    }
+    if cmp -s "$clean_target" "$clean_tmp"; then
+        rm -f "$clean_tmp"
+        return 1
+    fi
+    replace_config_file "$clean_target" "$clean_tmp" || {
+        rm -f "$clean_tmp"
+        return 2
+    }
+    return 0
+}
+
+config_glob_for_service() {
+    case "$1" in
+        box_bll) printf '%s\n' '/data/adb/box_bll/clash/*.yaml' ;;
+        box) printf '%s\n' '/data/adb/box/mihomo/*.yaml' ;;
+        clash) printf '%s\n' '/data/clash/*.yaml' ;;
+        Clash) printf '%s\n' '/data/media/0/Android/Clash/*.yaml' ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_managed_dns() {
+    cleanup_failed=0
+    for cleanup_service in box_bll box clash Clash; do
+        config_glob=$(config_glob_for_service "$cleanup_service") || continue
+        cleanup_changed=0
+        # shellcheck disable=SC2086
+        for cleanup_file in $config_glob; do
+            [ -f "$cleanup_file" ] || continue
+            clean_dns_config "$cleanup_file"
+            clean_result=$?
+            case "$clean_result" in
+                0) cleanup_changed=1 ;;
+                1) : ;;
+                *) cleanup_failed=1 ;;
+            esac
+        done
+        [ "$cleanup_changed" -eq 1 ] && restart_service "$cleanup_service"
+    done
+    [ "$cleanup_failed" -eq 0 ]
+}
+
 # URL+DNS 合并转换：先 URL 阶段再 DNS 阶段，全部在临时文件中完成，
 # 单次 mv 原子替换原文件，杜绝部分提交。
 # 返回：0=已修改，1=无变化，2=失败。
@@ -596,17 +668,44 @@ while :; do
     # 每轮重读配置（吸收自上游 20260829）：config.prop 可能被 customize.sh
     # 在备份恢复或用户手动修改后更新，重读使 PROXY_URL/redir_port 变更免重启生效。
     # shellcheck disable=SC1090
+    random_dns_port=yes
     [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
     # 每轮以 yaml 的有效 dns.port 覆盖 config.prop，端口无效时 process_configs 拒绝改写。
     load_agh_yaml_port || :
     # PROXY_URL 归一化值随之刷新。
     PROXY_URL_VALUE=$(printf '%s' "${PROXY_URL-}" | sed 's/[[:space:]]//g')
     retry_soon=0
-    process_configs box_bll "$1"
-    process_configs box "$1"
-    process_configs clash "$1"
-    process_configs Clash "$1"
-    [ "$1" = "--clean" ] && exit 0
+    if [ "$1" = "--clean" ]; then
+        process_configs box_bll "$1"
+        process_configs box "$1"
+        process_configs clash "$1"
+        process_configs Clash "$1"
+        exit 0
+    fi
+
+    if [ "${random_dns_port-yes}" = no ]; then
+        # 显式 no 模式绝不触碰 Mihomo/Clash：首次进入也不清理、不重启。
+        # 状态文件只用于区分后续 TLS 运行时模式，不是代理配置写入。
+        printf '%s\n' fixed > "$MODE_STATE_FILE" || :
+    elif tls_runtime_fixed; then
+        # 仅 TLS 运行时模式允许一次性清理旧版 AGH marker；此后不再
+        # 改写 Mihomo。TLS 也不写回 config.prop 的 random_dns_port。
+        previous_dns_mode=$(cat "$MODE_STATE_FILE" 2>/dev/null)
+        if [ "$previous_dns_mode" != tls ]; then
+            if cleanup_managed_dns; then
+                printf '%s\n' tls > "$MODE_STATE_FILE" || :
+            else
+                retry_soon=1
+            fi
+        fi
+    else
+        previous_dns_mode=$(cat "$MODE_STATE_FILE" 2>/dev/null)
+        [ "$previous_dns_mode" = random ] || printf '%s\n' random > "$MODE_STATE_FILE" || :
+        process_configs box_bll "$1"
+        process_configs box "$1"
+        process_configs clash "$1"
+        process_configs Clash "$1"
+    fi
     # AGH 未就绪导致跳过时，30 秒后重试；否则按常规长周期轮询。
     if [ "$retry_soon" -eq 1 ]; then sleep 30; else sleep 36000; fi
 done

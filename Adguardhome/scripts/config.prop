@@ -1,6 +1,8 @@
 # 注：以下修改后必须重启生效
 # AdGuardHome DNS 重定向端口
 redir_port=5591
+# DNS 端口随机化：yes 保持启动时随机端口，no 使用上面的固定端口
+random_dns_port=yes
 
 # SNI 过滤的模块规则源：默认应用 UID 范围和端口由本文件控制（默认是否
 # 启用由 AdGuardHome.yaml 的 sni_filter.enabled / filtering.blocking_mode 决定）。
