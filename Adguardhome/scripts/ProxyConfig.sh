@@ -155,11 +155,17 @@ dns_transform() {
                 s = section[i]
                 if (s == "" || s == "dns:default-nameserver") continue
                 l = raw[i]
+                if (s ~ /^dns:/ && dns_marker(l) && managed_local_item(raw[i + 1]))
+                    has_managed_pair[s] = 1
                 is_active_dns = active_dns_marker(l)
                 is_active_sniffer = active_sniffer_marker(l)
                 if ((s ~ /^dns:/ && is_active_dns) || (s ~ /^sniffer:/ && is_active_sniffer)) {
                     n = raw[i + 1]
+                    if (managed_local_item(n)) has_managed_pair[s] = 1
                     if (current_local_item(n)) valid_managed_pair[s] = 1
+                    if ((s == "dns:nameserver" || s == "dns:direct-nameserver") &&
+                        is_active_dns && current_local_item(n))
+                        active_dns_pair_count[s]++
                 }
             }
             # 直接列表 section：对所有 seen_target 检查有效配对
@@ -167,6 +173,9 @@ dns_transform() {
                 if (tid == "dns:default-nameserver") continue
                 if (!valid_managed_pair[tid] || has_other[tid]) need = 1
             }
+            if (active_dns_pair_count["dns:nameserver"] > 1 ||
+                active_dns_pair_count["dns:direct-nameserver"] > 1)
+                need = 1
             # marker 配对端口校验：active marker 紧邻 managed localhost 但端口非当前则 need
             for (i = 1; i <= NR; i++) {
                 l = raw[i]
@@ -232,8 +241,19 @@ dns_transform() {
                     n = raw[i + 1]
                     if (managed_local_item(n)) {
                         if (mode == "process") {
-                            print l
-                            print "    - 127.0.0.1:" port
+                            # Only one active managed pair is retained in each
+                            # managed DNS list. Disabled markers remain intact.
+                            if ((s == "dns:nameserver" || s == "dns:direct-nameserver") &&
+                                active_dns_marker(l)) {
+                                if (!active_dns_pair_written[s]) {
+                                    print l
+                                    print "    - 127.0.0.1:" port
+                                    active_dns_pair_written[s] = 1
+                                }
+                            } else {
+                                print l
+                                print "    - 127.0.0.1:" port
+                            }
                         }
                         i++
                         continue
@@ -251,7 +271,7 @@ dns_transform() {
                 }
                 # 已存在但为空的直接列表 section：在 key 后创建受管配对。
                 if (mode == "process" && (s == "dns:nameserver" || s == "dns:direct-nameserver") &&
-                    l ~ /^  [^[:space:]#][^:]*:/ && !valid_managed_pair[s] && !inserted[s]) {
+                    l ~ /^  [^[:space:]#][^:]*:/ && !has_managed_pair[s] && !inserted[s]) {
                     print l
                     print "    # AdGuardHome managed DNS"
                     print "    - 127.0.0.1:" port

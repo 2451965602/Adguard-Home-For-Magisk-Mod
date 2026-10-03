@@ -1,0 +1,2 @@
+*.sh text eol=lf
+Adguardhome/scripts/config.prop text eol=lf
