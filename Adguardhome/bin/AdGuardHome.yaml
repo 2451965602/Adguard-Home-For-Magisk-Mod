@@ -1464,3 +1464,9 @@ os:
   user: ""
   rlimit_nofile: 0
 schema_version: 34
+sni_filter:
+  enabled: false
+  queue_num: 7
+  ports: [443, 8443, 2053, 2083, 2087, 2095, 2096, 8080]
+  uids: [10000-19999]
+  drop_quic: false

@@ -1,0 +1,7 @@
+# Device-specific runtime state manually migrated from an installed module.
+# Keep it in a local release workspace; never commit it with the module.
+querylog.json
+querylog.json.*
+sessions.db
+stats.db
+data/

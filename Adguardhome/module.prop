@@ -1,6 +1,6 @@
 id=AdGuardHome
 name=AdGuard Home For Android
-version=20260829
-versionCode=2026082900
+version=20260927
+versionCode=2026092700
 author=
 description=设备未重启，请立即重启 (重启后仍提示，请排查设备环境) | Restart not detected. Reboot now (If prompt persists, check device environment)

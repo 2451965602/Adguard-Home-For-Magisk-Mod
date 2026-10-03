@@ -246,6 +246,199 @@ cleanup_dot6_rules() {
     ip6tables -w 2 -t filter -X AGHMOD_DOT6 >/dev/null 2>&1
 }
 
+# ===== SNI 过滤链（filter 表）=====
+# 这是 custom core 的专用入口，不触碰 BOX_*、DNS 或其他通用 filter 链。
+# 规则只将应用 UID 范围内、连接原始方向前 20,000 字节的 TCP 流量送入
+# custom core 的 NFQUEUE；--queue-bypass 保证队列进程异常时不阻断网络。
+# SNI 默认关闭：仅当 yaml 的 sni_filter.enabled=true，或
+# filtering.blocking_mode=strong 时安装。配置无效时清理两个专用链；某一
+# 地址族的能力缺失或规则失败时只清理该族，避免影响另一族的正常过滤。
+cleanup_sni4_rules() {
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_SNI4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -F AGHMOD_SNI4 >/dev/null 2>&1
+    iptables -w 2 -t filter -X AGHMOD_SNI4 >/dev/null 2>&1
+}
+
+cleanup_sni6_rules() {
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_SNI6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -F AGHMOD_SNI6 >/dev/null 2>&1
+    ip6tables -w 2 -t filter -X AGHMOD_SNI6 >/dev/null 2>&1
+}
+
+cleanup_sni_rules() {
+    cleanup_sni4_rules
+    cleanup_sni6_rules
+}
+
+# 读取顶层 YAML 标量。只认顶层段名和两个空格缩进，避免误读用户规则。
+sni_yaml_value() {
+    sni_yaml_section=$1
+    sni_yaml_key=$2
+    awk -v section="$sni_yaml_section" -v key="$sni_yaml_key" '
+        $0 == section ":" { in_section=1; next }
+        /^[^[:space:]#][^:]*:/ { in_section=0 }
+        in_section && $0 ~ "^  " key ":[[:space:]]*" {
+            sub("^  " key ":[[:space:]]*", "")
+            sub("[[:space:]]*#.*$", "")
+            print
+            exit
+        }
+    ' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null | tr -d "'\"\r"
+}
+
+# 返回：0=应安装，1=明确关闭，2=配置无效。
+sni_filter_state() {
+    sni_enabled=$(sni_yaml_value sni_filter enabled)
+    sni_blocking_mode=$(sni_yaml_value filtering blocking_mode)
+    sni_queue_num=$(sni_yaml_value sni_filter queue_num)
+
+    case "$sni_enabled" in
+        true|false) ;;
+        *) return 2 ;;
+    esac
+    # 仅依赖 custom core 约定的 strong，其余非空模式都表示明确关闭；
+    # 不在脚本中硬编码未来 core 可能新增的 blocking_mode。
+    case "$sni_blocking_mode" in
+        ''|*[!a-zA-Z0-9_-]*) return 2 ;;
+    esac
+    case "$sni_queue_num" in
+        ''|*[!0-9]*) return 2 ;;
+    esac
+    [ "$sni_queue_num" -le 65535 ] || return 2
+
+    # enabled=false 仍可由 strong 模式显式启用外部 SNI 规则。
+    if [ "$sni_enabled" = true ] || [ "$sni_blocking_mode" = strong ]; then
+        return 0
+    fi
+    return 1
+}
+
+sni_ports_are_valid() {
+    [ -n "$sni_uid_range" ] || return 1
+    case "$sni_uid_range" in
+        *[!0-9-]*|*-*-*) return 1 ;;
+    esac
+    case "$sni_uid_range" in *-*) ;; *) return 1 ;; esac
+    sni_uid_start=${sni_uid_range%-*}
+    sni_uid_end=${sni_uid_range#*-}
+    [ -n "$sni_uid_start" ] && [ -n "$sni_uid_end" ] || return 1
+    [ "$sni_uid_start" -le "$sni_uid_end" ] 2>/dev/null || return 1
+
+    old_ifs=$IFS
+    IFS=,
+    sni_port_count=0
+    for sni_port in $sni_ports; do
+        case "$sni_port" in
+            ''|*[!0-9]*) IFS=$old_ifs; return 1 ;;
+        esac
+        [ "$sni_port" -ge 1 ] && [ "$sni_port" -le 65535 ] || {
+            IFS=$old_ifs
+            return 1
+        }
+        sni_port_count=$((sni_port_count + 1))
+    done
+    IFS=$old_ifs
+    [ "$sni_port_count" -gt 0 ]
+}
+
+ensure_sni4_rules() {
+    iptables -w 2 -t filter -L AGHMOD_SNI4 >/dev/null 2>&1 || \
+        iptables -w 2 -t filter -N AGHMOD_SNI4 || return 1
+    iptables -w 2 -t filter -F AGHMOD_SNI4 || return 1
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_SNI4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -I OUTPUT -j AGHMOD_SNI4 || return 1
+
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_ports; do
+        iptables -w 2 -t filter -A AGHMOD_SNI4 -p tcp --dport "$sni_port" \
+            -m owner --uid-owner "$sni_uid_range" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass || { IFS=$old_ifs; return 1; }
+    done
+    IFS=$old_ifs
+}
+
+ensure_sni6_rules() {
+    ip6tables -w 2 -t filter -L AGHMOD_SNI6 >/dev/null 2>&1 || \
+        ip6tables -w 2 -t filter -N AGHMOD_SNI6 || return 1
+    ip6tables -w 2 -t filter -F AGHMOD_SNI6 || return 1
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_SNI6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -I OUTPUT -j AGHMOD_SNI6 || return 1
+
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_ports; do
+        ip6tables -w 2 -t filter -A AGHMOD_SNI6 -p tcp --dport "$sni_port" \
+            -m owner --uid-owner "$sni_uid_range" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass || { IFS=$old_ifs; return 1; }
+    done
+    IFS=$old_ifs
+}
+
+sni4_rules_are_valid() {
+    iptables -w 2 -t filter -L AGHMOD_SNI4 >/dev/null 2>&1 || return 1
+    iptables -w 2 -t filter -C OUTPUT -j AGHMOD_SNI4 >/dev/null 2>&1 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_ports; do
+        iptables -w 2 -t filter -C AGHMOD_SNI4 -p tcp --dport "$sni_port" \
+            -m owner --uid-owner "$sni_uid_range" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+    done
+    IFS=$old_ifs
+}
+
+sni6_rules_are_valid() {
+    ip6tables -w 2 -t filter -L AGHMOD_SNI6 >/dev/null 2>&1 || return 1
+    ip6tables -w 2 -t filter -C OUTPUT -j AGHMOD_SNI6 >/dev/null 2>&1 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_ports; do
+        ip6tables -w 2 -t filter -C AGHMOD_SNI6 -p tcp --dport "$sni_port" \
+            -m owner --uid-owner "$sni_uid_range" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+    done
+    IFS=$old_ifs
+}
+
+maintain_sni_rules() {
+    sni_filter_state
+    sni_state=$?
+    if [ "$sni_state" -ne 0 ]; then
+        cleanup_sni_rules
+        [ "$sni_state" -eq 2 ] && \
+            echo "$(date '+%F %T') [WARN] Invalid SNI filtering configuration; dedicated chains removed" >> "$MAIN_LOG"
+        return
+    fi
+    if ! sni_ports_are_valid; then
+        cleanup_sni_rules
+        echo "$(date '+%F %T') [WARN] Invalid SNI UID/port defaults; dedicated chains removed" >> "$MAIN_LOG"
+        return
+    fi
+    # IPv4/IPv6 必须独立维护：某些 Android 内核没有 ip6tables、connbytes
+    # 或 NFQUEUE，但不能因此重建或删除已经工作的 IPv4 链。
+    if ! sni4_rules_are_valid; then
+        if ! ensure_sni4_rules; then
+            cleanup_sni4_rules
+            echo "$(date '+%F %T') [WARN] SNI IPv4 NFQUEUE setup failed; AGHMOD_SNI4 removed" >> "$MAIN_LOG"
+        fi
+    fi
+    if ! sni6_rules_are_valid; then
+        if ! ensure_sni6_rules; then
+            cleanup_sni6_rules
+            echo "$(date '+%F %T') [WARN] SNI IPv6 NFQUEUE setup failed or ip6tables is unavailable; AGHMOD_SNI6 removed" >> "$MAIN_LOG"
+        fi
+    fi
+}
+
 # AGH 进程健康检查：仅记日志警告，不拉起（生命周期由 service.sh 管理）。
 # 不用 pgrep 判存活：开机早期 KernelSU 环境下 pgrep 可能不可用（返回 127 被
 # 误判为进程不存在），导致每 60 秒刷一条误报警告。以 redir_port 端口监听为准。
@@ -262,6 +455,10 @@ warn_if_agh_down() {
 
 # 规则守护循环
 while true; do
+    # config.prop 中的 SNI UID/端口允许不重启守护脚本调整；每轮读取也能
+    # 在用户恢复默认值后及时重建专用链。YAML 仍是 custom core 开关/队列真相源。
+    # shellcheck disable=SC1091
+    . "$AGH_DIR/scripts/config.prop"
     # 每轮重读 yaml 端口真相源（吸收自上游"每轮重读配置"的思想）：
     # service.sh 重试循环会随机化新端口并重启 AGH，本守护进程因锁持续存活，
     # 内存中的 redir_port 会过期——不重读就会把 DNS 重定向到死端口。
@@ -287,5 +484,8 @@ while true; do
     # DoT(853) 阻断独立维护：不依赖 box 接管状态，规则缺失即补齐。
     dot4_rules_valid || { ensure_dot4_rules || :; }
     dot6_rules_valid || { ensure_dot6_rules || :; }
+    # SNI 链完全独立于 DNS、DoT 和 Box 链；禁用、配置错误或安装失败时
+    # maintain_sni_rules 都会移除两个专用链及其 OUTPUT 跳转。
+    maintain_sni_rules
     sleep 60
 done

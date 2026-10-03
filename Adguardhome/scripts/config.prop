@@ -2,5 +2,13 @@
 # AdGuardHome DNS 重定向端口
 redir_port=5591
 
+# SNI 过滤的模块规则源：默认应用 UID 范围和端口由本文件控制（默认是否
+# 启用由 AdGuardHome.yaml 的 sni_filter.enabled / filtering.blocking_mode 决定）。
+# YAML 的 sni_filter.uids / ports 只是 custom core 的描述性兼容字段，默认值
+# 必须与这里保持一致；仅匹配这些 UID 的 TCP 连接，避免把 AGH、代理和系统
+# 进程送入 NFQUEUE。
+sni_uid_range="10000-19999"
+sni_ports="443,8443,2053,2083,2087,2095,2096,8080"
+
 # 代理订阅链接（在引号内填入你的订阅）
 PROXY_URL=" "
