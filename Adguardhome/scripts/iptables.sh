@@ -194,22 +194,40 @@ box_dns4_active() {
 # box 的 IPv6 nat 链带 6 后缀（NAT_DNS_HIJACK6/NAT_DNS_FORWARD6），与 IPv4 链名不同。
 # tun 模式下 box 不创建任何 DNS 劫持链（DNS 由 tun 接口内部劫持），三链探测必然
 # miss，此时 AGH 抢挂 nat REDIRECT 是预期接管行为：本机 DNS 进 AGH 而非 mihomo。
+ipv6_nat_is_supported() {
+    # /proc/net/ip6_tables_names is scoped to the current network namespace and
+    # lists the IPv6 tables actually registered in this module context.
+    if [ -r /proc/net/ip6_tables_names ]; then
+        grep -qx 'nat' /proc/net/ip6_tables_names
+        return $?
+    fi
+    # Older kernels may not expose the proc entry; fall back to a quiet table
+    # listing rather than probing individual chains and misclassifying errors.
+    ip6tables -w 2 -t nat -L >/dev/null 2>&1
+}
+
 box_dns6_active() {
     saw_unknown=0
-    # 不同 Box 版本对 IPv6 链名有无 6 后缀两种实现，均保守识别。
-    box_chain_dns_active ip6tables nat NAT_DNS_HIJACK; rc=$?
-    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
-    box_chain_dns_active ip6tables nat NAT_DNS_FORWARD; rc=$?
-    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
-    box_chain_dns_active ip6tables nat NAT_DNS_HIJACK6; rc=$?
-    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
-    box_chain_dns_active ip6tables nat NAT_DNS_FORWARD6; rc=$?
-    [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+    IPV6_NAT_UNSUPPORTED=0
+    if ipv6_nat_is_supported; then
+        # 不同 Box 版本对 IPv6 链名有无 6 后缀两种实现，均保守识别。
+        box_chain_dns_active ip6tables nat NAT_DNS_HIJACK; rc=$?
+        [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+        box_chain_dns_active ip6tables nat NAT_DNS_FORWARD; rc=$?
+        [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+        box_chain_dns_active ip6tables nat NAT_DNS_HIJACK6; rc=$?
+        [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+        box_chain_dns_active ip6tables nat NAT_DNS_FORWARD6; rc=$?
+        [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
+    else
+        IPV6_NAT_UNSUPPORTED=1
+    fi
     box_chain_dns_active ip6tables mangle BOX_LOCAL; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     box_tun_dns_active ip6tables; rc=$?
     [ $rc -eq 0 ] && return 0; [ $rc -eq 2 ] && saw_unknown=1
     [ $saw_unknown -eq 1 ] && return 2
+    [ "$IPV6_NAT_UNSUPPORTED" -eq 1 ] && return 3
     return 1
 }
 
@@ -270,6 +288,25 @@ cleanup_sni_rules() {
     cleanup_sni6_rules
 }
 
+# QUIC/DoQ 使用独立的 UDP 链，绝不改变现有 TCP SNI 链。仅观察每条
+# conntrack 流的前 16KiB，并通过相同的 NFQUEUE 交给 custom core。
+cleanup_quic4_rules() {
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_QUIC4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -F AGHMOD_QUIC4 >/dev/null 2>&1
+    iptables -w 2 -t filter -X AGHMOD_QUIC4 >/dev/null 2>&1
+}
+
+cleanup_quic6_rules() {
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_QUIC6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -F AGHMOD_QUIC6 >/dev/null 2>&1
+    ip6tables -w 2 -t filter -X AGHMOD_QUIC6 >/dev/null 2>&1
+}
+
+cleanup_quic_rules() {
+    cleanup_quic4_rules
+    cleanup_quic6_rules
+}
+
 # 读取顶层 YAML 标量。只认顶层段名和两个空格缩进，避免误读用户规则。
 sni_yaml_value() {
     sni_yaml_section=$1
@@ -284,6 +321,92 @@ sni_yaml_value() {
             exit
         }
     ' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null | tr -d "'\"\r"
+}
+
+# Extract only simple block lists under sni_filter. YAML features outside this
+# deliberately narrow grammar fail closed instead of being partially interpreted.
+sni_yaml_list() {
+    awk -v wanted="$1" '
+        function fail() { invalid=1 }
+        /^[[:space:]]*($|#)/ { next }
+        $0 == "sni_filter:" {
+            sections++
+            if (sections > 1) fail()
+            in_section=1
+            next
+        }
+        /^[^[:space:]#][^:]*:/ {
+            in_section=0
+            in_list=0
+        }
+        !in_section { next }
+        /^  [A-Za-z_][A-Za-z0-9_-]*:/ {
+            property=$0
+            sub(/^  /, "", property)
+            sub(/:.*/, "", property)
+            in_list=0
+            if (property == wanted) {
+                found++
+                if (found > 1) fail()
+                if (wanted == "uids" && $0 == "  uids: []") {
+                    empty_list=1
+                    in_list=0
+                    next
+                }
+                if ($0 != "  " wanted ":") fail()
+                in_list=1
+            }
+            next
+        }
+        in_list {
+            if ($0 !~ /^    - /) {
+                fail()
+                next
+            }
+            value=substr($0, 7)
+            if (wanted == "uids") {
+                # AGH may serialize the same scalar bare, single-quoted, or double-quoted.
+                # Remove only YAML comments introduced by separating whitespace; then
+                # unwrap one matching quote pair and require exactly decimal start-end.
+                sub(/[[:space:]]+#.*$/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+                uid_quote=substr(value, 1, 1)
+                if (uid_quote == "\"" || uid_quote == sprintf("%c", 39)) {
+                    if (length(value) < 3 || substr(value, length(value), 1) != uid_quote) {
+                        fail()
+                        next
+                    }
+                    value=substr(value, 2, length(value)-2)
+                }
+                if (value !~ /^[0-9]+-[0-9]+$/) {
+                    fail()
+                    next
+                }
+            } else {
+                if (value !~ /^[0-9]+([[:space:]]+#.*)?[[:space:]]*$/) {
+                    fail()
+                    next
+                }
+                sub(/[[:space:]]+#.*$/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+            }
+            if (count++) result=result ","
+            result=result value
+        }
+        END {
+            if (sections != 1 || found != 1 || invalid || count == 0 &&
+                (wanted != "uids" || empty_list != 1)) exit 1
+            print result
+        }
+    ' "$AGH_DIR/bin/AdGuardHome.yaml" 2>/dev/null
+}
+
+load_sni_rule_lists() {
+    sni_uid_range=$(sni_yaml_list uids)
+    sni_uid_list_status=$?
+    [ "$sni_uid_list_status" -eq 0 ] || sni_uid_range=
+    sni_ports=$(sni_yaml_list ports) || sni_ports=
+    sni_quic_ports=$(sni_yaml_list quic_ports) || sni_quic_ports=
 }
 
 # 返回：0=应安装，1=明确关闭，2=配置无效。
@@ -313,16 +436,86 @@ sni_filter_state() {
     return 1
 }
 
-sni_ports_are_valid() {
-    [ -n "$sni_uid_range" ] || return 1
+sni_uid_ranges_are_valid() {
+    # An explicitly empty UID list means every process; other values are ranges.
+    [ "$sni_uid_list_status" -eq 0 ] || return 1
+    [ -n "$sni_uid_range" ] || return 0
     case "$sni_uid_range" in
-        *[!0-9-]*|*-*-*) return 1 ;;
+        *[!0-9,-]*|,*|*,|*,,*) return 1 ;;
     esac
-    case "$sni_uid_range" in *-*) ;; *) return 1 ;; esac
-    sni_uid_start=${sni_uid_range%-*}
-    sni_uid_end=${sni_uid_range#*-}
-    [ -n "$sni_uid_start" ] && [ -n "$sni_uid_end" ] || return 1
-    [ "$sni_uid_start" -le "$sni_uid_end" ] 2>/dev/null || return 1
+    old_ifs=$IFS
+    IFS=,
+    sni_uid_range_count=0
+    for sni_uid_segment in $sni_uid_range; do
+        case "$sni_uid_segment" in *-*-*|*-) IFS=$old_ifs; return 1 ;; esac
+        case "$sni_uid_segment" in *-*) ;; *) IFS=$old_ifs; return 1 ;; esac
+        sni_uid_start=${sni_uid_segment%-*}
+        sni_uid_end=${sni_uid_segment#*-}
+        [ -n "$sni_uid_start" ] && [ -n "$sni_uid_end" ] || {
+            IFS=$old_ifs
+            return 1
+        }
+        # Strip leading zeros so decimal values such as 08 are not parsed as octal.
+        sni_uid_start_cmp=$(printf '%s' "$sni_uid_start" | sed 's/^0*//')
+        sni_uid_end_cmp=$(printf '%s' "$sni_uid_end" | sed 's/^0*//')
+        [ -n "$sni_uid_start_cmp" ] || sni_uid_start_cmp=0
+        [ -n "$sni_uid_end_cmp" ] || sni_uid_end_cmp=0
+        [ "$sni_uid_start_cmp" -le "$sni_uid_end_cmp" ] 2>/dev/null || {
+            IFS=$old_ifs
+            return 1
+        }
+        sni_uid_range_count=$((sni_uid_range_count + 1))
+    done
+    IFS=$old_ifs
+    [ "$sni_uid_range_count" -gt 0 ]
+}
+
+# Empty uid means no owner match (all processes). Keep rule construction and
+# validity checks identical so existing rules are not needlessly rebuilt.
+sni_tcp_rule() {
+    sni_rule_cmd=$1
+    sni_rule_op=$2
+    sni_rule_chain=$3
+    sni_rule_port=$4
+    sni_rule_uid=$5
+    if [ -n "$sni_rule_uid" ]; then
+        "$sni_rule_cmd" -w 2 -t filter "$sni_rule_op" "$sni_rule_chain" \
+            -p tcp --dport "$sni_rule_port" -m owner --uid-owner "$sni_rule_uid" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass
+    else
+        "$sni_rule_cmd" -w 2 -t filter "$sni_rule_op" "$sni_rule_chain" \
+            -p tcp --dport "$sni_rule_port" \
+            -m connbytes --connbytes 0:20000 --connbytes-dir original \
+            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
+            --queue-bypass
+    fi
+}
+
+sni_quic_rule() {
+    sni_rule_cmd=$1
+    sni_rule_op=$2
+    sni_rule_chain=$3
+    sni_rule_port=$4
+    sni_rule_uid=$5
+    if [ -n "$sni_rule_uid" ]; then
+        "$sni_rule_cmd" -w 2 -t filter "$sni_rule_op" "$sni_rule_chain" \
+            -p udp --dport "$sni_rule_port" -m owner --uid-owner "$sni_rule_uid" \
+            -m connbytes --connbytes 0:16383 --connbytes-dir original \
+            --connbytes-mode bytes -m length --length 0:16384 \
+            -j NFQUEUE --queue-num "$sni_queue_num" --queue-bypass
+    else
+        "$sni_rule_cmd" -w 2 -t filter "$sni_rule_op" "$sni_rule_chain" \
+            -p udp --dport "$sni_rule_port" \
+            -m connbytes --connbytes 0:16383 --connbytes-dir original \
+            --connbytes-mode bytes -m length --length 0:16384 \
+            -j NFQUEUE --queue-num "$sni_queue_num" --queue-bypass
+    fi
+}
+
+sni_ports_are_valid() {
+    sni_uid_ranges_are_valid || return 1
 
     old_ifs=$IFS
     IFS=,
@@ -341,6 +534,162 @@ sni_ports_are_valid() {
     [ "$sni_port_count" -gt 0 ]
 }
 
+sni_quic_ports_are_valid() {
+    [ -n "$sni_quic_ports" ] && sni_uid_ranges_are_valid || return 1
+
+    case "$sni_quic_ports" in
+        *[!0-9,]*|,*|*,|*,,*) return 1 ;;
+    esac
+    old_ifs=$IFS
+    IFS=,
+    sni_port_count=0
+    for sni_port in $sni_quic_ports; do
+        case "$sni_port" in ''|*[!0-9]*) IFS=$old_ifs; return 1 ;; esac
+        [ "$sni_port" -ge 1 ] && [ "$sni_port" -le 65535 ] || {
+            IFS=$old_ifs
+            return 1
+        }
+        sni_port_count=$((sni_port_count + 1))
+    done
+    IFS=$old_ifs
+    [ "$sni_port_count" -gt 0 ]
+}
+
+ensure_quic4_rules() {
+    iptables -w 2 -t filter -L AGHMOD_QUIC4 >/dev/null 2>&1 || \
+        iptables -w 2 -t filter -N AGHMOD_QUIC4 || return 1
+    iptables -w 2 -t filter -F AGHMOD_QUIC4 || return 1
+    while iptables -w 2 -t filter -D OUTPUT -j AGHMOD_QUIC4 >/dev/null 2>&1; do :; done
+    iptables -w 2 -t filter -I OUTPUT -j AGHMOD_QUIC4 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_quic_ports; do
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_quic_rule iptables -A AGHMOD_QUIC4 "$sni_port" "$sni_uid_segment" || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_quic_rule iptables -A AGHMOD_QUIC4 "$sni_port" '' || { IFS=$old_ifs; return 1; }
+        fi
+    done
+    IFS=$old_ifs
+}
+
+ensure_quic6_rules() {
+    ip6tables -w 2 -t filter -L AGHMOD_QUIC6 >/dev/null 2>&1 || \
+        ip6tables -w 2 -t filter -N AGHMOD_QUIC6 || return 1
+    ip6tables -w 2 -t filter -F AGHMOD_QUIC6 || return 1
+    while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_QUIC6 >/dev/null 2>&1; do :; done
+    ip6tables -w 2 -t filter -I OUTPUT -j AGHMOD_QUIC6 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_quic_ports; do
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_quic_rule ip6tables -A AGHMOD_QUIC6 "$sni_port" "$sni_uid_segment" || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_quic_rule ip6tables -A AGHMOD_QUIC6 "$sni_port" '' || { IFS=$old_ifs; return 1; }
+        fi
+    done
+    IFS=$old_ifs
+}
+
+quic4_rules_are_valid() {
+    iptables -w 2 -t filter -L AGHMOD_QUIC4 >/dev/null 2>&1 || return 1
+    iptables -w 2 -t filter -C OUTPUT -j AGHMOD_QUIC4 >/dev/null 2>&1 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_quic_ports; do
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_quic_rule iptables -C AGHMOD_QUIC4 "$sni_port" "$sni_uid_segment" >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_quic_rule iptables -C AGHMOD_QUIC4 "$sni_port" '' >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        fi
+    done
+    IFS=$old_ifs
+}
+
+quic6_rules_are_valid() {
+    ip6tables -w 2 -t filter -L AGHMOD_QUIC6 >/dev/null 2>&1 || return 1
+    ip6tables -w 2 -t filter -C OUTPUT -j AGHMOD_QUIC6 >/dev/null 2>&1 || return 1
+    old_ifs=$IFS
+    IFS=,
+    for sni_port in $sni_quic_ports; do
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_quic_rule ip6tables -C AGHMOD_QUIC6 "$sni_port" "$sni_uid_segment" >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_quic_rule ip6tables -C AGHMOD_QUIC6 "$sni_port" '' >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        fi
+    done
+    IFS=$old_ifs
+}
+
+SNI_QUIC_CONFIG_WARNED=0
+maintain_quic_rules() {
+    sni_inspect_quic=$(sni_yaml_value sni_filter inspect_quic)
+    if [ -z "$sni_inspect_quic" ]; then
+        cleanup_quic_rules
+        if [ "$SNI_QUIC_CONFIG_WARNED" -eq 0 ]; then
+            echo "$(date '+%F %T') [WARN] sni_filter.inspect_quic is missing; treating as false and removing QUIC NFQUEUE rules" >> "$MAIN_LOG"
+            SNI_QUIC_CONFIG_WARNED=1
+        fi
+        return
+    fi
+    case "$sni_inspect_quic" in
+        true|false) ;;
+        *)
+            cleanup_quic_rules
+            if [ "$SNI_QUIC_CONFIG_WARNED" -eq 0 ]; then
+                echo "$(date '+%F %T') [WARN] Invalid sni_filter.inspect_quic; treating as false and removing QUIC NFQUEUE rules" >> "$MAIN_LOG"
+                SNI_QUIC_CONFIG_WARNED=1
+            fi
+            return
+            ;;
+    esac
+    if ! sni_quic_ports_are_valid; then
+        cleanup_quic_rules
+        if [ "$SNI_QUIC_CONFIG_WARNED" -eq 0 ]; then
+            echo "$(date '+%F %T') [WARN] Missing or invalid YAML sni_filter.uids/quic_ports lists; dedicated chains removed" >> "$MAIN_LOG"
+            SNI_QUIC_CONFIG_WARNED=1
+        fi
+        return
+    fi
+    if [ "$sni_inspect_quic" != true ]; then
+        SNI_QUIC_CONFIG_WARNED=0
+        cleanup_quic_rules
+        return
+    fi
+    sni_filter_state
+    sni_state=$?
+    if [ "$sni_state" -ne 0 ]; then
+        cleanup_quic_rules
+        if [ "$sni_state" -eq 2 ] && \
+            [ "$SNI_QUIC_CONFIG_WARNED" -eq 0 ]; then
+            echo "$(date '+%F %T') [WARN] QUIC inspection requested but SNI state is invalid; dedicated chains removed" >> "$MAIN_LOG"
+            SNI_QUIC_CONFIG_WARNED=1
+        elif [ "$sni_state" -eq 1 ]; then
+            SNI_QUIC_CONFIG_WARNED=0
+        fi
+        return
+    fi
+    SNI_QUIC_CONFIG_WARNED=0
+    # Rebuild from the current YAML set every pass: -C only proves expected rules
+    # exist and cannot detect stale UID/port rules left after a config shrink.
+    if ! ensure_quic4_rules; then
+        cleanup_quic4_rules
+        echo "$(date '+%F %T') [WARN] QUIC IPv4 NFQUEUE setup failed; AGHMOD_QUIC4 removed" >> "$MAIN_LOG"
+    fi
+    if ! ensure_quic6_rules; then
+        cleanup_quic6_rules
+        echo "$(date '+%F %T') [WARN] QUIC IPv6 NFQUEUE setup failed or ip6tables is unavailable; AGHMOD_QUIC6 removed" >> "$MAIN_LOG"
+    fi
+}
+
 ensure_sni4_rules() {
     iptables -w 2 -t filter -L AGHMOD_SNI4 >/dev/null 2>&1 || \
         iptables -w 2 -t filter -N AGHMOD_SNI4 || return 1
@@ -351,11 +700,13 @@ ensure_sni4_rules() {
     old_ifs=$IFS
     IFS=,
     for sni_port in $sni_ports; do
-        iptables -w 2 -t filter -A AGHMOD_SNI4 -p tcp --dport "$sni_port" \
-            -m owner --uid-owner "$sni_uid_range" \
-            -m connbytes --connbytes 0:20000 --connbytes-dir original \
-            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
-            --queue-bypass || { IFS=$old_ifs; return 1; }
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_tcp_rule iptables -A AGHMOD_SNI4 "$sni_port" "$sni_uid_segment" || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_tcp_rule iptables -A AGHMOD_SNI4 "$sni_port" '' || { IFS=$old_ifs; return 1; }
+        fi
     done
     IFS=$old_ifs
 }
@@ -370,11 +721,13 @@ ensure_sni6_rules() {
     old_ifs=$IFS
     IFS=,
     for sni_port in $sni_ports; do
-        ip6tables -w 2 -t filter -A AGHMOD_SNI6 -p tcp --dport "$sni_port" \
-            -m owner --uid-owner "$sni_uid_range" \
-            -m connbytes --connbytes 0:20000 --connbytes-dir original \
-            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
-            --queue-bypass || { IFS=$old_ifs; return 1; }
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_tcp_rule ip6tables -A AGHMOD_SNI6 "$sni_port" "$sni_uid_segment" || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_tcp_rule ip6tables -A AGHMOD_SNI6 "$sni_port" '' || { IFS=$old_ifs; return 1; }
+        fi
     done
     IFS=$old_ifs
 }
@@ -385,11 +738,13 @@ sni4_rules_are_valid() {
     old_ifs=$IFS
     IFS=,
     for sni_port in $sni_ports; do
-        iptables -w 2 -t filter -C AGHMOD_SNI4 -p tcp --dport "$sni_port" \
-            -m owner --uid-owner "$sni_uid_range" \
-            -m connbytes --connbytes 0:20000 --connbytes-dir original \
-            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
-            --queue-bypass >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_tcp_rule iptables -C AGHMOD_SNI4 "$sni_port" "$sni_uid_segment" >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_tcp_rule iptables -C AGHMOD_SNI4 "$sni_port" '' >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        fi
     done
     IFS=$old_ifs
 }
@@ -400,42 +755,51 @@ sni6_rules_are_valid() {
     old_ifs=$IFS
     IFS=,
     for sni_port in $sni_ports; do
-        ip6tables -w 2 -t filter -C AGHMOD_SNI6 -p tcp --dport "$sni_port" \
-            -m owner --uid-owner "$sni_uid_range" \
-            -m connbytes --connbytes 0:20000 --connbytes-dir original \
-            --connbytes-mode bytes -j NFQUEUE --queue-num "$sni_queue_num" \
-            --queue-bypass >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        if [ -n "$sni_uid_range" ]; then
+            for sni_uid_segment in $sni_uid_range; do
+                sni_tcp_rule ip6tables -C AGHMOD_SNI6 "$sni_port" "$sni_uid_segment" >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+            done
+        else
+            sni_tcp_rule ip6tables -C AGHMOD_SNI6 "$sni_port" '' >/dev/null 2>&1 || { IFS=$old_ifs; return 1; }
+        fi
     done
     IFS=$old_ifs
 }
 
+SNI_RULES_CONFIG_WARNED=0
 maintain_sni_rules() {
+    if ! sni_ports_are_valid; then
+        cleanup_sni_rules
+        if [ "$SNI_RULES_CONFIG_WARNED" -eq 0 ]; then
+            echo "$(date '+%F %T') [WARN] Missing or invalid YAML sni_filter.uids/ports lists; dedicated chains removed" >> "$MAIN_LOG"
+            SNI_RULES_CONFIG_WARNED=1
+        fi
+        return
+    fi
     sni_filter_state
     sni_state=$?
     if [ "$sni_state" -ne 0 ]; then
         cleanup_sni_rules
-        [ "$sni_state" -eq 2 ] && \
-            echo "$(date '+%F %T') [WARN] Invalid SNI filtering configuration; dedicated chains removed" >> "$MAIN_LOG"
+        if [ "$sni_state" -eq 2 ]; then
+            if [ "$SNI_RULES_CONFIG_WARNED" -eq 0 ]; then
+                echo "$(date '+%F %T') [WARN] Invalid SNI filtering configuration; dedicated chains removed" >> "$MAIN_LOG"
+                SNI_RULES_CONFIG_WARNED=1
+            fi
+        else
+            SNI_RULES_CONFIG_WARNED=0
+        fi
         return
     fi
-    if ! sni_ports_are_valid; then
-        cleanup_sni_rules
-        echo "$(date '+%F %T') [WARN] Invalid SNI UID/port defaults; dedicated chains removed" >> "$MAIN_LOG"
-        return
+    SNI_RULES_CONFIG_WARNED=0
+    # Rebuild each dedicated chain from the current YAML set. The families stay
+    # independent so missing IPv6 support cannot affect a working IPv4 chain.
+    if ! ensure_sni4_rules; then
+        cleanup_sni4_rules
+        echo "$(date '+%F %T') [WARN] SNI IPv4 NFQUEUE setup failed; AGHMOD_SNI4 removed" >> "$MAIN_LOG"
     fi
-    # IPv4/IPv6 必须独立维护：某些 Android 内核没有 ip6tables、connbytes
-    # 或 NFQUEUE，但不能因此重建或删除已经工作的 IPv4 链。
-    if ! sni4_rules_are_valid; then
-        if ! ensure_sni4_rules; then
-            cleanup_sni4_rules
-            echo "$(date '+%F %T') [WARN] SNI IPv4 NFQUEUE setup failed; AGHMOD_SNI4 removed" >> "$MAIN_LOG"
-        fi
-    fi
-    if ! sni6_rules_are_valid; then
-        if ! ensure_sni6_rules; then
-            cleanup_sni6_rules
-            echo "$(date '+%F %T') [WARN] SNI IPv6 NFQUEUE setup failed or ip6tables is unavailable; AGHMOD_SNI6 removed" >> "$MAIN_LOG"
-        fi
+    if ! ensure_sni6_rules; then
+        cleanup_sni6_rules
+        echo "$(date '+%F %T') [WARN] SNI IPv6 NFQUEUE setup failed or ip6tables is unavailable; AGHMOD_SNI6 removed" >> "$MAIN_LOG"
     fi
 }
 
@@ -454,9 +818,9 @@ warn_if_agh_down() {
 }
 
 # 规则守护循环
+IPV6_NAT_UNSUPPORTED_WARNED=0
 while true; do
-    # config.prop 中的 SNI UID/端口允许不重启守护脚本调整；每轮读取也能
-    # 在用户恢复默认值后及时重建专用链。YAML 仍是 custom core 开关/队列真相源。
+    # 非 SNI 模块配置仍从 config.prop 读取；SNI/QUIC 规则列表只从 YAML 读取。
     # shellcheck disable=SC1091
     . "$AGH_DIR/scripts/config.prop"
     # 每轮重读 yaml 端口真相源（吸收自上游"每轮重读配置"的思想）：
@@ -476,16 +840,34 @@ while true; do
     esac
     box_dns6_active; v6_rc=$?
     case $v6_rc in
-        0) cleanup_agh6_rules ;;
+        0) [ "$IPV6_NAT_UNSUPPORTED" -eq 1 ] || cleanup_agh6_rules ;;
         1) rules6_are_valid || { ensure_ipv6_rules || :; } ;;
         # unknown 时不安装新规则，并清掉已有 AGH IPv6 DNS 规则。
-        2) cleanup_agh6_rules; log_box_dns_unknown 6 ;;
+        2)
+            if [ "$IPV6_NAT_UNSUPPORTED" -eq 0 ]; then
+                cleanup_agh6_rules
+                log_box_dns_unknown 6
+            fi
+            ;;
+        # nat 不可用时不能维护 AGHMOD_DNS6；mangle/TUN 探测仍在上方执行。
+        3) : ;;
     esac
+    if [ "$IPV6_NAT_UNSUPPORTED" -eq 1 ]; then
+        if [ "$IPV6_NAT_UNSUPPORTED_WARNED" -eq 0 ]; then
+            echo "$(date '+%F %T') [WARN] IPv6 NAT unsupported; AGH IPv6 DNS interception disabled" >> "$MAIN_LOG"
+            IPV6_NAT_UNSUPPORTED_WARNED=1
+        fi
+    else
+        IPV6_NAT_UNSUPPORTED_WARNED=0
+    fi
     # DoT(853) 阻断独立维护：不依赖 box 接管状态，规则缺失即补齐。
     dot4_rules_valid || { ensure_dot4_rules || :; }
     dot6_rules_valid || { ensure_dot6_rules || :; }
+    load_sni_rule_lists
     # SNI 链完全独立于 DNS、DoT 和 Box 链；禁用、配置错误或安装失败时
     # maintain_sni_rules 都会移除两个专用链及其 OUTPUT 跳转。
     maintain_sni_rules
+    # QUIC 是独立 UDP 子功能：必须显式 inspect_quic=true，且复用 SNI queue_num。
+    maintain_quic_rules
     sleep 60
 done

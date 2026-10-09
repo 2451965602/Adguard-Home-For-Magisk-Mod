@@ -33,12 +33,10 @@ ADGPATH="/data/adb/modules/AdGuardHome"
 i18n_print "- Stopping module service processes" "- 正在终止模块服务进程"
 pkill -TERM -f '[/]iptables.sh'
 pkill -TERM -f '[/]NoAdsService.sh'
-pkill -TERM -f '[/]ProxyConfig.sh'
 pkill -TERM -f '[/]ModuleMOD.sh'
 module_processes_stopped() {
     ! pgrep -f '[/]iptables.sh' >/dev/null 2>&1 &&
     ! pgrep -f '[/]NoAdsService.sh' >/dev/null 2>&1 &&
-    ! pgrep -f '[/]ProxyConfig.sh' >/dev/null 2>&1 &&
     ! pgrep -f '[/]ModuleMOD.sh' >/dev/null 2>&1
 }
 i=0
@@ -50,7 +48,6 @@ done
 if ! module_processes_stopped; then
     pkill -KILL -f '[/]iptables.sh'
     pkill -KILL -f '[/]NoAdsService.sh'
-    pkill -KILL -f '[/]ProxyConfig.sh'
     pkill -KILL -f '[/]ModuleMOD.sh'
 fi
 if ! module_processes_stopped; then
@@ -163,15 +160,4 @@ chown root:net_raw "$BIN_DIR/AdGuardHome"
 i18n_print "- Locking script files" "- 正在锁定脚本文件"
 find "$SCRIPT_DIR" -type f -name "*.sh" -exec chattr +i {} \;
 
-# 正在保留配置文件：只恢复 PROXY_URL（吸收自上游 20260829）。
-# 全量覆盖会把旧版 config.prop 回退到新安装包（redir_port 等以新包为准，
-# 服务启动时 service.sh 会重写 redir_port），仅订阅链接是用户资产必须保留。
-if [ -f "$BACKUP_DIR/config.prop" ]; then
-  old_line=$(grep -m1 '^PROXY_URL=' "$BACKUP_DIR/config.prop")
-  if [ -n "$old_line" ]; then
-    sed -i "/^PROXY_URL=/d" "$SCRIPT_DIR/config.prop"
-    printf '%s\n' "$old_line" >> "$SCRIPT_DIR/config.prop"
-    i18n_print "- Preserved PROXY_URL from backup" "- 已从备份恢复 PROXY_URL"
-  fi
-fi
 i18n_print "- Installation complete. Reboot device." "- 安装完成，请重启设备。"

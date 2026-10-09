@@ -1466,7 +1466,23 @@ os:
 schema_version: 34
 sni_filter:
   enabled: false
+  inspect_quic: true
   queue_num: 7
-  ports: [443, 8443, 2053, 2083, 2087, 2095, 2096, 8080]
-  uids: [10000-19999]
+  uids:
+    - "10000-19999"
+    - "90000-99999"
+  ports:
+    - 443
+    - 8443
+    - 2053
+    - 2083
+    - 2087
+    - 2095
+    - 2096
+    - 8080
+  quic_ports:
+    - 443
+    - 853
+    - 784
+    - 8853
   drop_quic: false

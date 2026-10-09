@@ -17,11 +17,10 @@
 ```mermaid
 graph TD
     subgraph 独立管理器[独立管理器 - adguard-home-manager-mod]
-        M1[Flutter 应用<br>arm64-v8a] --> M2[自动读取 YAML<br>获取随机管理端口]
+        M1[Flutter 应用<br>arm64-v8a] --> M2[自动读取 YAML<br>获取管理端口]
         M2 --> M3[使用 root/root 凭证<br>连接 AGH API]
         M3 --> M4[首页：全部保护开关<br>暂停时长选择]
         M3 --> M5[日志·统计·DNS配置]
-        M3 --> M6[订阅链接 PROXY_URL<br>写入 config.prop]
         M1 --> M7[通知栏快捷磁贴开关]
         M1 --> M8[开机自启动 MainActivity]
     end
@@ -40,7 +39,7 @@ graph TD
         S3 -->|有| S4[禁用模块并退出]
         S3 -->|无| S5{AGH进程是否已运行?}
         S5 -->|是（软重启）| S6[跳过初始化]
-        S5 -->|否（冷启动）| S7[随机化端口·修改配置]
+        S5 -->|否（冷启动）| S7[读取并验证固定 DNS 端口·更新 DNS 配置]
         S7 --> S8[启动AGH]
         S8 --> S9{启动验证成功?}
         S9 -->|是| S10[记录启动成功]
@@ -75,14 +74,6 @@ graph TD
         D2E --> D2F[sleep 5 回到循环]
         D2F --> D2
 
-        D3["ProxyConfig.sh"]
-        D3 --> D3A[每轮重载 config.prop]
-        D3A --> D3B[遍历代理配置文件]
-        D3B --> D3C[修改YAML DNS指向AGH]
-        D3C --> D3D[重启代理服务·刷新网络]
-        D3D --> D3E[sleep 5 回到循环]
-        D3E --> D3
-
         D4["ModuleMOD.sh"]
         D4 --> D4A[检测系统语言]
         D4A --> D4B{语言是否变化?}
@@ -95,11 +86,10 @@ graph TD
 
     subgraph 卸载流程[卸载流程 - uninstall.sh]
         U1[开始卸载] --> U2[遍历 /proc 停止所有 AGH 及脚本进程]
-        U2 --> U3[ProxyConfig --clean 还原代理配置]
-        U3 --> U4[清理 iptables 规则]
-        U4 --> U5[解锁 chattr 并删除残留文件]
-        U5 --> U6[删除 AGH 残留目录]
-        U6 --> U7[卸载完成，无残留]
+        U2 --> U3[清理 iptables 规则]
+        U3 --> U4[解锁 chattr 并删除残留文件]
+        U4 --> U5[删除 AGH 残留目录]
+        U5 --> U6[卸载完成，无残留]
     end
 
     %% 垂直顺序：管理器 → 安装 → 启动 → 守护 → 卸载
@@ -114,7 +104,6 @@ graph TD
     style S11 fill:#faa,stroke:#333
     style D1 fill:#e1f5e1,stroke:#333
     style D2 fill:#e1f0f5,stroke:#333
-    style D3 fill:#f5e1e1,stroke:#333
     style D4 fill:#f5f0e1,stroke:#333
     style DIR fill:#fff,stroke:#fff
     style M1 fill:#e8d5f5,stroke:#333
@@ -159,10 +148,10 @@ graph TD
 - 一定要关闭或卸载其他广告拦截模块、无障碍跳过软件、VPN代理去广告、浏览器自带广告拦截等等
 - 遇到广告拦截不掉的话清除该应用的全部数据后重试
 - 如果你使用的是Magisk框架，那么点击模块旁边的操作按钮就可以进入Web UI管理器
-- 如果你有自己修改代理模块配置文件的癖好请不要用本模块，谢谢
+- DNS 重定向端口可在 `/data/adb/agh/scripts/config.prop` 的 `redir_port` 中配置，默认 `5591`；无效时回退到 `5591`，不会随机化或改写该配置
+- 模块不会读取订阅链接、改写代理模块配置或管理代理配置；代理模块的 DNS 行为需自行配置
 - 代理模块和代理软件不是同一个，是两个不同的概念
 - 代理软件教程：使用Chash Meta导致无法正常过滤的，可以去Chash Meta设置-网络中关闭系统代理
-- 代理模块教程：订阅链接只能填一个且在/data/adb/agh/scripts/config.prop中填入你的机场订阅保存重启即可自动兼容代理模块，剩下的交给模块自行处理就行
 - 中国科学大学测速网：[点击跳转](https://test.ustc.edu.cn)
 - 测试广告拦截是否正常（达到96%或以上是正常）：[点击跳转](https://paileactivist.github.io/toolz/adblock.html)
 ## 💬 获取联系方式

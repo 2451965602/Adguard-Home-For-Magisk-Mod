@@ -1,7 +1,6 @@
 #!/system/bin/sh
 AGH_DIR="/data/adb/agh"
 ADGPATH="/data/adb/modules/AdGuardHome"
-PROXY_SCRIPT="$AGH_DIR/scripts/ProxyConfig.sh"
 
 # 优雅停止本模块守护脚本和 AdGuardHome。
 pkill -TERM -f '[/]iptables.sh'
@@ -52,7 +51,7 @@ while ip6tables -w 2 -t filter -D OUTPUT -j AGHMOD_DOT6 >/dev/null 2>&1; do :; d
 ip6tables -w 2 -t filter -F AGHMOD_DOT6 >/dev/null 2>&1
 ip6tables -w 2 -t filter -X AGHMOD_DOT6 >/dev/null 2>&1
 
-# 停止 NoAdsService 和 ProxyConfig：TERM 后等待确认，必要时 KILL。
+# 停止 NoAdsService：TERM 后等待确认，必要时 KILL。
 stop_module_process() {
     pkill -TERM -f "$1" 2>/dev/null
     w=0
@@ -64,10 +63,6 @@ stop_module_process() {
     pgrep -f "$1" >/dev/null 2>&1 && pkill -KILL -f "$1" 2>/dev/null
 }
 stop_module_process '[/]NoAdsService.sh'
-stop_module_process '[/]ProxyConfig.sh'
-
-# 还原代理模块修改
-[ -f "$PROXY_SCRIPT" ] && "$PROXY_SCRIPT" --clean
 
 # 解除锁定并删除残留文件
 grep 'block_ad' "$AGH_DIR/scripts/NoAdsService.sh"|grep -o '".*"'|tr -d '"'|while IFS= read -r p;do [ -n "$p" ]&&[ -e "$p" ]&&find "$p" \( -type f -o -type d \) |while IFS= read -r f;do if [ -d "$f" ];then lsattr -d "$f"|grep -q "i-"&&{ chattr -i "$f";rmdir "$f";};else lsattr "$f"|grep -q "i-"&&{ chattr -i "$f";rm -f "$f";};fi;done;done

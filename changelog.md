@@ -1,3 +1,4 @@
+- DNS 重定向端口改为固定配置：service.sh 始终读取并验证 redir_port（无效时回退 5591），不再随机化 DNS/HTTP 端口或管理代理订阅及 YAML 配置
 - 合并上游 20260829：吸收其 853/DoT 端口阻断（带 root 豁免，不影响 mihomo 等 root 代理内核的 DoT 上游）、NoAdsService 新增拦截汽水音乐/大学搜题酱/建信基金广告、AdGuardHome.yaml 规则更新（DoH 域名拦截、淘宝闪购商家零售版/决胜巅峰/小米应用安装器放行、规则库与内核 v0.107.79）
 - 修复开机自启动失败循环：service.sh/iptables.sh/ProxyConfig.sh/NoAdsService.sh 移除对 pgrep 的依赖（开机早期 KernelSU 环境下 pgrep 可能不可用导致判定恒假），统一改用 /proc/net 端口监听判定 AGH 就绪、mkdir 原子锁防脚本重复启动
 - iptables.sh 增加 AdGuardHome.yaml 端口真相源，防止 config.prop 端口漂移导致 DNS 重定向到死端口
